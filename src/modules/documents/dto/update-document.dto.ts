@@ -17,7 +17,7 @@ import { DocType, parseAudienceEntries } from './create-document.dto';
 import { AudienceEntryDto } from './audience-entry.dto';
 
 // Letters (any language, incl. Khmer marks), numbers, spaces and hyphens.
-const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s-]+$/u;
+const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s_-]+$/u;
 
 // Metadata-only edit of an existing upload (files are not changed here).
 export class UpdateDocumentDto {

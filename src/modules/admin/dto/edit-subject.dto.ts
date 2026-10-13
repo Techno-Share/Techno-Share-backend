@@ -37,4 +37,14 @@ export class EditSubjectDto {
   @Type(() => Number)
   @IsIn([1, 2])
   semester?: number;
+
+  /**
+   * The cover, as a URL. An uploaded `image` file wins over this; the empty
+   * string clears the cover, which is how the form removes one — IsOptional
+   * only skips `undefined`, so '' still reaches the service.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(2048)
+  subject_url?: string;
 }

@@ -1,3 +1,4 @@
+import { MAX_BATCH_BYTES } from '../upload-limits';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
@@ -6,7 +7,7 @@ import { RedisService } from '../redis/redis.service';
  * A rolling byte budget per user, on top of the request-count limits.
  *
  * The `upload` rate tier caps how OFTEN someone uploads; it says nothing about
- * how much. 60 requests × 10 files × 20 MB is a legal way to push 12 GB in ten
+ * how much. 60 requests × 10 files × 50 MB is a legal way to push 30 GB in ten
  * minutes. This caps the volume.
  *
  * Deliberately complements the existing limits rather than replacing them:
@@ -105,10 +106,12 @@ export class UploadQuotaService {
       this.config.get<string>('UPLOAD_BYTE_WINDOW_SECONDS'),
     );
 
-    // Defaults sized against the existing limits: 200 MB an hour is ten full
-    // 20 MB files, which is generous for coursework and still bounded.
+    // One full batch an hour: generous for coursework and still bounded.
+    // Derived rather than written out, so raising the file cap cannot leave
+    // the quota behind — if it did, the quota rather than the cap would be
+    // what refuses an ordinary upload, with a far less obvious message.
     this.maxBytes =
-      Number.isFinite(bytes) && bytes > 0 ? bytes : 200 * 1024 * 1024;
+      Number.isFinite(bytes) && bytes > 0 ? bytes : MAX_BATCH_BYTES;
     this.windowMs =
       Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60 * 60 * 1000;
   }

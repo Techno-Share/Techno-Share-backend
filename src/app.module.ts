@@ -23,6 +23,7 @@ import { TelegramModule } from './modules/telegram/telegram.module';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module';
 import { BooksModule } from './modules/books/books.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { MulterExceptionFilter } from './common/filters/multer-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 
@@ -67,7 +68,11 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
     // successes, the filter covers failures (including guard rejections, which
     // never reach an interceptor).
     { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
+    // Order matters: Nest applies the LAST-registered filter first, so the
+    // Multer one gets to turn its errors into 4xx before AllExceptionsFilter
+    // would log them as 500s.
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
+    { provide: APP_FILTER, useClass: MulterExceptionFilter },
   ],
 })
 export class AppModule {}

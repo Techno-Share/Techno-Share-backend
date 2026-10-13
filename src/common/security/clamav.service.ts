@@ -27,7 +27,7 @@ export type ScanVerdict =
   /** Scanner could not be consulted. Never treat this as clean. */
   | { status: 'unavailable'; reason: string };
 
-/** Streamed in pieces rather than one write, so a 20 MB file respects backpressure. */
+/** Streamed in pieces rather than one write, so a 50 MB file respects backpressure. */
 const CHUNK_BYTES = 64 * 1024;
 
 @Injectable()
@@ -45,7 +45,7 @@ export class ClamAvService implements OnModuleInit {
     this.port = Number(this.config.get<string>('CLAMAV_PORT')) || 3310;
 
     const timeout = Number(this.config.get<string>('CLAMAV_TIMEOUT_MS'));
-    // 30 s: a 20 MB file scans in well under a second on a warm clamd, so this
+    // 30 s: a 50 MB file scans in well under a second on a warm clamd, so this
     // is a hang detector rather than a budget.
     this.timeoutMs =
       Number.isFinite(timeout) && timeout >= 1000 && timeout <= 120_000

@@ -9,7 +9,7 @@ import {
 } from 'class-validator';
 
 // Letters (any language, incl. Khmer marks), numbers, spaces and hyphens.
-const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s-]+$/u;
+const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s_-]+$/u;
 // Free text that simply must not contain template-injection characters.
 const NO_FORBIDDEN_PATTERN = /^[^${}]*$/;
 const FORBIDDEN_MESSAGE = 'Must not contain $, { or }';

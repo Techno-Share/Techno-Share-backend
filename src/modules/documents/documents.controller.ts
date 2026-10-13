@@ -29,6 +29,10 @@ import { AddFilesDto } from './dto/add-files.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
 import { QueryDocumentsDto } from './dto/query-documents.dto';
 import { RateLimitTier } from '../../common/rate-limit/rate-limit.decorator';
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_FILES_PER_UPLOAD,
+} from '../../common/upload-limits';
 
 type AuthenticatedRequest = {
   user: {
@@ -50,8 +54,8 @@ const ALLOWED_MIME_TYPES = [
   'application/x-rar-compressed',
   'application/vnd.rar',
 ];
-const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
-const MAX_FILES_PER_UPLOAD = 10;
+// Limits live in common/upload-limits.ts — the byte quota and the error
+// messages are derived from the same numbers.
 
 @Controller('documents')
 export class DocumentsController {

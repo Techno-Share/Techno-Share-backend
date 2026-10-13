@@ -18,14 +18,62 @@ import { BookRequest } from '../books/entities/book-request.entity';
 import { Notification } from '../notifications/entities/notification.entity';
 import { Major } from '../majors/entities/major.entity';
 import { yearLevelsForMajor } from '../documents/utils/year-levels';
-import { StorageService } from '../storage/storage.service';
+import { BUCKETS, StorageService } from '../storage/storage.service';
+import { REJECTED_FILE_RETENTION_MS } from '../../common/retention';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ModerationService, Reviewer } from './moderation.service';
 import { PromotionSettingsService } from '../settings/promotion-settings.service';
+import type { Paginated } from '../../common/dto/pagination.dto';
+import type {
+  ListDocumentsDto,
+  ListSubjectsDto,
+  ListUsersDto,
+  SortOrder,
+} from './dto/list-admin.dto';
 
-const SUBJECT_STATUSES = ['active', 'pending', 'rejected'];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * What a caller gets when they ask for no particular page size.
+ *
+ * Matches the smallest option the admin tables offer, so the first paint costs
+ * the least; a caller wanting more asks for it.
+ */
+export const DEFAULT_ADMIN_PAGE_SIZE = 10;
+
+/**
+ * Turn the validated page/limit into the two numbers the query builder needs.
+ *
+ * The DTO has already bounded both, so this does not re-validate; it exists so
+ * the three list methods cannot disagree about the default.
+ */
+function pageWindow(query: { page?: number; limit?: number }) {
+  const limit = query.limit ?? DEFAULT_ADMIN_PAGE_SIZE;
+  const page = query.page ?? 1;
+  return { limit, page, skip: (page - 1) * limit };
+}
+
+/**
+ * Resolve a whitelisted sort field to the column the query builder orders by.
+ *
+ * `sortBy` has already been checked against an `@IsIn` list, so the lookup is
+ * the second gate rather than the first — a value that somehow reached here
+ * without matching a key falls back to the default instead of being
+ * interpolated. No client string is ever concatenated into SQL.
+ */
+function orderColumn<T extends string>(
+  columns: Record<T, string>,
+  fallback: string,
+  sortBy: T | undefined,
+): string {
+  return (sortBy && columns[sortBy]) || fallback;
+}
+
+/** ASC or DESC, defaulting to DESC — newest first, which every table wants. */
+function sortDirection(order: SortOrder | undefined): 'ASC' | 'DESC' {
+  return order === 'ASC' ? 'ASC' : 'DESC';
+}
 
 @Injectable()
 export class AdminService {
@@ -70,21 +118,101 @@ export class AdminService {
   // ─── Stats ─────────────────────────────────────────────────────────────────
 
   async getStats() {
-    const [totalUsers, totalDocuments, totalSubjects, totalBooks] =
-      await Promise.all([
-        this.users.count(),
-        this.uploads.count({ where: { status: 'active' } }),
-        this.subjects.count({ where: { status: 'active' } }),
-        this.books.count(),
-      ]);
+    const [
+      totalUsers,
+      totalDocuments,
+      totalSubjects,
+      totalBooks,
+      uploadsByMonth,
+      documentsByDepartment,
+      documentsByStatus,
+    ] = await Promise.all([
+      this.users.count(),
+      this.uploads.count({ where: { status: 'active' } }),
+      this.subjects.count({ where: { status: 'active' } }),
+      this.books.count(),
+      this.uploadsByMonth(),
+      this.documentsByDepartment(),
+      this.documentsByStatus(),
+    ]);
 
     return {
       totalUsers,
       totalDocuments,
       totalSubjects,
       totalBooks,
-      uploadsByMonth: await this.uploadsByMonth(),
+      uploadsByMonth,
+      documentsByDepartment,
+      documentsByStatus,
     };
+  }
+
+  /**
+   * Approved uploads per department, busiest first.
+   *
+   * A LEFT JOIN from `majors`, so a department with nothing in it comes back as
+   * 0 rather than being absent — an empty department is the single most useful
+   * thing this chart says, and dropping the row would hide it.
+   *
+   * Counts `status = 'active'`, matching the Documents stat card. The status
+   * donut partitions a wider set (every non-pending upload), so the two totals
+   * differ on purpose and each chart says which it is counting.
+   */
+  private async documentsByDepartment() {
+    const rows: { acronym: string; count: string }[] = await this.uploads.query(
+      `
+      select m.acronym, count(u.id) as count
+        from majors m
+   left join uploads u
+          on u.major_id = m.id
+         and u.status = 'active'
+    group by m.acronym
+    -- Acronym breaks ties so equal departments keep a stable order between
+    -- requests; without it the chart reshuffles on every refresh.
+    order by count(u.id) desc, m.acronym asc
+      `,
+    );
+
+    return rows.map((r) => ({ acronym: r.acronym, count: Number(r.count) }));
+  }
+
+  /**
+   * Every non-pending upload, bucketed into the four states the Documents tab
+   * displays.
+   *
+   * The CASE mirrors documentStatusClause — and docDisplayStatus in the
+   * frontend — including the precedence: hidden beats rejected, which beats
+   * expired. One CASE rather than four counting queries is what guarantees the
+   * buckets are mutually exclusive, so the slices really do sum to the whole.
+   * Four separate counts could drift apart and a donut built on them would be
+   * quietly lying.
+   *
+   * Pending is excluded for the same reason the tab excludes it: those uploads
+   * belong to Approvals.
+   */
+  private async documentsByStatus() {
+    const rows: { status: string; count: string }[] = await this.uploads.query(
+      `
+      select case
+               when u.hidden_at is not null then 'hidden'
+               when u.status = 'rejected'   then 'rejected'
+               when u.expires_at is not null and u.expires_at <= now()
+                                            then 'expired'
+               else 'active'
+             end      as status,
+             count(*) as count
+        from uploads u
+       where u.status <> 'pending'
+    group by 1
+      `,
+    );
+
+    const counts = new Map(rows.map((r) => [r.status, Number(r.count)]));
+    // Fixed order, and every bucket present even at zero: the chart's colours
+    // are assigned by slot, so a missing bucket would repaint the survivors.
+    return (['active', 'hidden', 'expired', 'rejected'] as const).map(
+      (status) => ({ status, count: counts.get(status) ?? 0 }),
+    );
   }
 
   /**
@@ -119,106 +247,144 @@ export class AdminService {
     return rows.map((r) => ({ month: r.month, count: Number(r.count) }));
   }
 
-  // ─── Recent uploads ────────────────────────────────────────────────────────
-
-  async getRecentDocuments(limit = 10) {
-    let rows: Upload[];
-    try {
-      rows = await this.uploads.find({
-        where: { status: 'active' },
-        relations: {
-          uploader: true,
-          major: true,
-          subject: true,
-          documents: true,
-        },
-        order: { uploaded_at: 'DESC' },
-        take: limit,
-      });
-    } catch {
-      throw new InternalServerErrorException(
-        'Failed to fetch recent documents',
-      );
-    }
-
-    return rows.map((u) => ({
-      id: u.id,
-      title: u.title,
-      doc_type: u.doc_type,
-      uploaded_at: u.uploaded_at,
-      users: u.uploader
-        ? {
-            id: u.uploader.id,
-            first_name: u.uploader.first_name,
-            last_name: u.uploader.last_name,
-          }
-        : null,
-      majors: u.major ? { id: u.major.id, acronym: u.major.acronym } : null,
-      subjects: u.subject ? { id: u.subject.id, name: u.subject.name } : null,
-      documents: (u.documents ?? []).map((d) => ({
-        file_size_kb: d.file_size_kb,
-      })),
-    }));
-  }
-
   // ─── Users ─────────────────────────────────────────────────────────────────
 
-  async getAllUsers(search?: string) {
+  /** Columns the users table may be ordered by, keyed by the DTO's enum. */
+  private static readonly USER_SORT_COLUMNS = {
+    created_at: 'u.created_at',
+    first_name: 'u.first_name',
+    last_name: 'u.last_name',
+    email: 'u.email',
+    role: 'u.role',
+    year_level: 'u.year_level',
+  } as const;
+
+  async getAllUsers(query: ListUsersDto = {}): Promise<Paginated<unknown>> {
+    const { limit, page, skip } = pageWindow(query);
     const qb = this.users
       .createQueryBuilder('u')
-      .leftJoinAndSelect('u.major', 'major')
-      .orderBy('u.created_at', 'DESC');
+      .leftJoinAndSelect('u.major', 'major');
 
-    if (search) {
-      qb.where(
+    if (query.search) {
+      qb.andWhere(
         '(u.first_name ILIKE :s OR u.last_name ILIKE :s OR u.email ILIKE :s)',
-        { s: `%${search}%` },
+        { s: `%${query.search}%` },
       );
     }
 
+    /**
+     * Banned or not, decided in SQL rather than after the fetch.
+     *
+     * `users` carries no relation to `user_bans`, and the ban in force is the
+     * row with no lifted_at, so this is an EXISTS rather than a join — a join
+     * would duplicate a user who has been banned more than once, which would
+     * then corrupt both the page and the count.
+     */
+    if (query.status) {
+      const clause = `${query.status === 'banned' ? 'EXISTS' : 'NOT EXISTS'} (
+        SELECT 1 FROM user_bans b
+         WHERE b.user_id = u.id AND b.lifted_at IS NULL
+      )`;
+      qb.andWhere(clause);
+    }
+
+    qb.orderBy(
+      orderColumn(AdminService.USER_SORT_COLUMNS, 'u.created_at', query.sortBy),
+      sortDirection(query.order),
+    )
+      // Without a tie-break, two accounts created in the same transaction have
+      // no defined order, so the same row can appear on two pages (or neither).
+      .addOrderBy('u.id', 'DESC')
+      .skip(skip)
+      .take(limit);
+
     let rows: User[];
+    let total: number;
     try {
-      rows = await qb.getMany();
+      [rows, total] = await qb.getManyAndCount();
     } catch {
       throw new InternalServerErrorException('Failed to fetch users');
     }
 
-    // One query for every assignment, rather than one per user.
+    // One query for every assignment, rather than one per user. Now scoped to
+    // the page, so these two cost a page's worth of ids instead of the table's.
     const ids = rows.map((u) => u.id);
     const moderatedBy = await this.moderation.assignmentsByUser(ids);
     // Same reason: the ban in force now lives in user_bans, and asking per row
     // would put a query behind every line of the table.
     const activeBans = await this.bans.activeBansFor(ids);
 
-    return rows.map((u) => ({
-      id: u.id,
-      first_name: u.first_name,
-      last_name: u.last_name,
-      email: u.email,
-      role: u.role,
-      year_level: u.year_level,
-      created_at: u.created_at,
-      majors: u.major ? { id: u.major.id, acronym: u.major.acronym } : null,
-      // Everything the admin UI needs to show state and offer the right action.
-      // Shape unchanged from when these were columns on `users`, so the client
-      // reads the same fields.
-      banned_at: activeBans.get(u.id)?.banned_at ?? null,
-      ban_reason: activeBans.get(u.id)?.reason ?? null,
-      moderates: moderatedBy.get(u.id) ?? [],
-    }));
+    return {
+      items: rows.map((u) => ({
+        id: u.id,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        email: u.email,
+        role: u.role,
+        year_level: u.year_level,
+        created_at: u.created_at,
+        majors: u.major ? { id: u.major.id, acronym: u.major.acronym } : null,
+        // Everything the admin UI needs to show state and offer the right
+        // action. Shape unchanged from when these were columns on `users`, so
+        // the client reads the same fields.
+        banned_at: activeBans.get(u.id)?.banned_at ?? null,
+        ban_reason: activeBans.get(u.id)?.reason ?? null,
+        moderates: moderatedBy.get(u.id) ?? [],
+      })),
+      total,
+      page,
+      limit,
+    };
   }
 
   // ─── All documents (admin table view) ─────────────────────────────────────
 
-  async getAllDocuments(filters: {
-    search?: string;
-    docType?: string;
-    majorId?: string;
-    uploaderId?: string;
-    /** ISO timestamp; only uploads at or after it are returned. */
-    since?: string;
-  }) {
-    const { search, docType, majorId, uploaderId, since } = filters;
+  /** Columns the documents table may be ordered by, keyed by the DTO's enum. */
+  private static readonly DOCUMENT_SORT_COLUMNS = {
+    uploaded_at: 'u.uploaded_at',
+    title: 'u.title',
+    doc_type: 'u.doc_type',
+    year_level: 'u.year_level',
+    status: 'u.status',
+  } as const;
+
+  /**
+   * The display status the browser used to compute, expressed as SQL.
+   *
+   * Mirrors docDisplayStatus() in AdminDashboardView.vue, INCLUDING its
+   * precedence: hidden wins over rejected, which wins over expired. Getting
+   * that order wrong would move rows between tabs rather than merely paginate
+   * them, so the four branches are mutually exclusive by construction — every
+   * row lands in exactly one, and the four counts sum to the table.
+   */
+  private static documentStatusClause(view: string): string {
+    switch (view) {
+      case 'hidden':
+        return 'u.hidden_at IS NOT NULL';
+      case 'rejected':
+        return "u.hidden_at IS NULL AND u.status = 'rejected'";
+      case 'expired':
+        return `u.hidden_at IS NULL AND u.status <> 'rejected'
+                AND u.expires_at IS NOT NULL AND u.expires_at <= now()`;
+      default: // 'active'
+        return `u.hidden_at IS NULL AND u.status <> 'rejected'
+                AND (u.expires_at IS NULL OR u.expires_at > now())`;
+    }
+  }
+
+  async getAllDocuments(
+    filters: ListDocumentsDto = {},
+  ): Promise<Paginated<unknown>> {
+    const { limit, page, skip } = pageWindow(filters);
+    const {
+      search,
+      doc_type: docType,
+      major_id: majorId,
+      uploader_id: uploaderId,
+      status,
+      since,
+    } = filters;
+
     const qb = this.uploads
       .createQueryBuilder('u')
       .leftJoinAndSelect('u.uploader', 'uploader')
@@ -226,13 +392,31 @@ export class AdminService {
       .leftJoinAndSelect('u.major', 'major')
       .leftJoinAndSelect('u.subject', 'subject')
       .leftJoinAndSelect('u.documents', 'documents')
-      .where('u.status = :status', { status: 'active' })
-      .orderBy('u.uploaded_at', 'DESC');
+      /**
+       * Never 'pending' — those uploads are the review queue's, and listing
+       * them here would offer a second place to see them with no way to act.
+       * The DTO's @IsIn keeps 'pending' out of `status`; this keeps it out of
+       * the result regardless of which of the four views is selected.
+       */
+      .where("u.status <> 'pending'")
+      .andWhere(AdminService.documentStatusClause(status ?? 'active'));
 
+    /**
+     * Title, description, or who uploaded it — the uploader dropdown this
+     * replaced made you pick from every registered user to answer "what did
+     * Sok upload?".
+     *
+     * The name is matched as one concatenated string so "pha roth" works as
+     * typed; first and last are halves of a single field, unlike the title,
+     * which is tested separately so a term cannot match by straddling the two.
+     */
     if (search)
-      qb.andWhere('(u.title ILIKE :search OR u.description ILIKE :search)', {
-        search: `%${search}%`,
-      });
+      qb.andWhere(
+        `(u.title ILIKE :search
+          OR u.description ILIKE :search
+          OR concat(uploader.first_name, ' ', uploader.last_name) ILIKE :search)`,
+        { search: `%${search}%` },
+      );
     if (docType) qb.andWhere('u.doc_type = :docType', { docType });
     if (majorId)
       qb.andWhere('u.major_id = :majorId', {
@@ -249,9 +433,34 @@ export class AdminService {
       qb.andWhere('u.uploaded_at >= :since', { since: from });
     }
 
+    qb.orderBy(
+      orderColumn(
+        AdminService.DOCUMENT_SORT_COLUMNS,
+        'u.uploaded_at',
+        filters.sortBy,
+      ),
+      sortDirection(filters.order),
+    )
+      .addOrderBy('u.id', 'DESC')
+      .skip(skip)
+      .take(limit);
+
     let rows: Upload[];
+    let total: number;
     try {
-      rows = await qb.getMany();
+      /**
+       * skip/take rather than limit/offset, which is what makes this correct
+       * across the one-to-many join to `documents`. TypeORM answers a paginated
+       * joined query by first selecting DISTINCT ids with the ordering applied
+       * and only then fetching those rows' children — so a page is N uploads,
+       * not N upload-file pairs, and `total` counts uploads too.
+       *
+       * Ordering only ever names columns on `u` for the same reason: Postgres
+       * rejects a SELECT DISTINCT whose ORDER BY references an expression
+       * outside the select list, which is how an inline CASE in the student
+       * feed once 500'd the whole endpoint.
+       */
+      [rows, total] = await qb.getManyAndCount();
     } catch {
       throw new InternalServerErrorException('Failed to fetch documents');
     }
@@ -259,12 +468,19 @@ export class AdminService {
     // Signed here, not returned raw: the `documents` bucket is private, so the
     // stored URL would 403 in the admin table. Same treatment as every other
     // list — see signRef.
-    return Promise.all(
+    const items = await Promise.all(
       rows.map(async (u) => ({
         id: u.id,
         title: u.title,
         doc_type: u.doc_type,
         uploaded_at: u.uploaded_at,
+        /**
+         * 'active' or 'rejected' — the only two this tab lists; pending belongs
+         * to Approvals. Returned even though the caller filters on it, so a row
+         * says what it is without the reader having to remember which filter is
+         * selected.
+         */
+        status: u.status,
         users: u.uploader
           ? {
               id: u.uploader.id,
@@ -287,6 +503,29 @@ export class AdminService {
         majors: u.major ? { id: u.major.id, acronym: u.major.acronym } : null,
         /** The cohort the upload is for; the table shows it as "I3-GIC". */
         year_level: u.year_level,
+        /** Which academic year the material belongs to, e.g. "2025-2026". */
+        academic_year: u.academic_year,
+        /**
+         * Who may see it, as (department, year) pairs; empty means everyone.
+         * Ids rather than acronyms — the admin screen already holds the
+         * department list it needs to name them.
+         */
+        audience: u.audience ?? [],
+        /** Soft expiry. Null = never. */
+        expires_at: u.expires_at,
+        /**
+         * Set when the uploader withdrew it from circulation. Hidden and
+         * expired are not review states — they sit alongside `status`, and the
+         * table folds all four into one column the way the owner's dashboard
+         * does.
+         */
+        hidden_at: u.hidden_at,
+        /**
+         * Why it was turned down. Null on anything not rejected, and on
+         * rejections recorded before a reason was mandatory — the table shows
+         * the line only when there is one rather than an empty "Reason:".
+         */
+        rejection_reason: u.rejection_reason,
         subjects: u.subject ? { id: u.subject.id, name: u.subject.name } : null,
         description: u.description,
         documents: await Promise.all(
@@ -312,6 +551,8 @@ export class AdminService {
         ),
       })),
     );
+
+    return { items, total, page, limit };
   }
 
   // ─── User administration ───────────────────────────────────────────────────
@@ -670,141 +911,71 @@ export class AdminService {
     return { is_admin: false, majors };
   }
 
-  async getPendingSubjects(reviewer: Reviewer) {
-    // null = admin, no limit. [] = moderates nothing, so the queue is empty —
-    // an unscoped query here would show every department's submissions.
-    const scope = this.moderation.scopeMajorIds(reviewer);
-    if (scope?.length === 0) return [];
+  /** Columns the subjects table may be ordered by, keyed by the DTO's enum. */
+  private static readonly SUBJECT_SORT_COLUMNS = {
+    created_at: 's.created_at',
+    name: 's.name',
+    acronym: 's.acronym',
+    year_level: 's.year_level',
+    semester: 's.semester',
+  } as const;
 
-    let rows: Subject[];
-    try {
-      const qb = this.subjects
-        .createQueryBuilder('s')
-        .leftJoinAndSelect('s.major', 'major')
-        .leftJoinAndSelect('s.submitter', 'submitter')
-        .where('s.status = :status', { status: 'pending' })
-        .orderBy('s.id', 'DESC');
-      if (scope) qb.andWhere('s.major_id IN (:...scope)', { scope });
-      rows = await qb.getMany();
-    } catch {
-      throw new InternalServerErrorException(
-        'Failed to fetch pending subjects',
-      );
-    }
-
-    return rows.map((s) => this.subjectAdminShape(s));
-  }
-
-  async approveSubject(id: string, reviewer: Reviewer) {
-    const subject = await this.subjects.findOne({
-      where: { id },
-      select: { name: true, submitted_by: true, major_id: true },
-    });
-    // The department comes from the subject, never from the request.
-    if (subject) this.moderation.assertCanModerate(reviewer, subject.major_id);
-
-    try {
-      await this.subjects.update(
-        { id },
-        { status: 'active', reviewed_by: reviewer.id },
-      );
-    } catch {
-      throw new InternalServerErrorException('Failed to approve subject');
-    }
-
-    if (subject?.submitted_by) {
-      void this.notificationsService.create({
-        user_id: subject.submitted_by,
-        type: 'subject_approved',
-        message: `Your subject "${subject.name}" has been approved.`,
-        key: 'subjectApproved',
-        params: { name: subject.name },
-        ref_id: id,
-        ref_type: 'subject',
-      });
-    }
-
-    return { message: 'Subject approved' };
-  }
-
-  async rejectSubject(id: string, reviewer: Reviewer, reason?: string) {
-    const subject = await this.subjects.findOne({
-      where: { id },
-      select: {
-        name: true,
-        submitted_by: true,
-        subject_url: true,
-        major_id: true,
-      },
-    });
-    if (subject) this.moderation.assertCanModerate(reviewer, subject.major_id);
-
-    const imageKey = this.storage.extractKey(subject?.subject_url ?? null);
-    if (imageKey) await this.storage.remove([imageKey]);
-
-    try {
-      await this.subjects.update(
-        { id },
-        {
-          status: 'rejected',
-          rejection_reason: reason ?? null,
-          rejected_at: new Date(),
-          reviewed_by: reviewer.id,
-        },
-      );
-    } catch {
-      throw new InternalServerErrorException('Failed to reject subject');
-    }
-
-    if (subject?.submitted_by) {
-      void this.notificationsService.create({
-        user_id: subject.submitted_by,
-        type: 'subject_rejected',
-        message: `Your subject "${subject.name}" was not approved.${
-          reason ? ` Reason: ${reason}` : ''
-        }`,
-        key: reason ? 'subjectRejectedReason' : 'subjectRejected',
-        params: { name: subject.name, reason: reason ?? '' },
-        ref_id: id,
-        ref_type: 'subject',
-      });
-    }
-
-    return { message: 'Subject rejected' };
-  }
-
-  async getAllSubjects(search?: string, majorId?: string, status?: string) {
+  async getAllSubjects(
+    query: ListSubjectsDto = {},
+  ): Promise<Paginated<unknown>> {
+    const { limit, page, skip } = pageWindow(query);
+    const { search, major_id: majorId } = query;
     const qb = this.subjects
       .createQueryBuilder('s')
       .leftJoinAndSelect('s.major', 'major')
       .leftJoinAndSelect('s.submitter', 'submitter')
-      .orderBy('s.status', 'ASC')
-      .addOrderBy('s.id', 'DESC');
+      /**
+       * Active only, and not as a filter the caller can change.
+       *
+       * Subjects have no review: one is created by a moderator of its own
+       * department and is live immediately, so there is no status to choose
+       * between. What is left are rows stranded mid-review when that was
+       * removed — invisible to students, since every lookup filters to active,
+       * and listing them here would offer an admin something they cannot act
+       * on and cannot explain.
+       */
+      .andWhere('s.status = :active', { active: 'active' });
 
     if (search) qb.andWhere('s.name ILIKE :search', { search: `%${search}%` });
     if (majorId)
       qb.andWhere('s.major_id = :majorId', {
         majorId: this.assertUuid(majorId, 'major_id'),
       });
-    if (status) {
-      if (!SUBJECT_STATUSES.includes(status))
-        throw new BadRequestException(
-          `status must be one of: ${SUBJECT_STATUSES.join(', ')}`,
-        );
-      qb.andWhere('s.status = :status', { status });
-    }
+
+    qb.orderBy(
+      orderColumn(
+        AdminService.SUBJECT_SORT_COLUMNS,
+        's.created_at',
+        query.sortBy,
+      ),
+      sortDirection(query.order),
+    )
+      // Newest first by default. Ordering on the uuid alone put the rows in no
+      // order at all; the id now only breaks ties — which is also what keeps a
+      // row from appearing on two pages when sorting by a non-unique column.
+      .addOrderBy('s.id', 'DESC')
+      .skip(skip)
+      .take(limit);
 
     let rows: Subject[];
+    let total: number;
     try {
-      rows = await qb.getMany();
+      [rows, total] = await qb.getManyAndCount();
     } catch {
       throw new InternalServerErrorException('Failed to fetch subjects');
     }
 
-    return rows.map((s) => ({
-      ...this.subjectAdminShape(s),
-      status: s.status,
-    }));
+    return {
+      items: rows.map((s) => this.subjectAdminShape(s)),
+      total,
+      page,
+      limit,
+    };
   }
 
   private subjectAdminShape(s: Subject) {
@@ -830,19 +1001,80 @@ export class AdminService {
 
   async editSubject(
     id: string,
-    dto: { name?: string; acronym?: string; semester?: number },
+    dto: {
+      name?: string;
+      acronym?: string;
+      semester?: number;
+      subject_url?: string;
+    },
+    image?: Express.Multer.File,
   ) {
     const updates: Partial<Subject> = {};
     if (dto.name?.trim()) updates.name = dto.name.trim();
     if (dto.acronym?.trim()) updates.acronym = dto.acronym.trim();
     if (dto.semester !== undefined) updates.semester = dto.semester;
 
+    /**
+     * The cover, by the same rules the create route follows: a sent file wins,
+     * an empty `subject_url` clears it, and absent means leave it alone.
+     *
+     * The previous object is read before the write and removed only after it
+     * succeeds — deleting first would lose the old cover for a save that then
+     * fails, and deleting unconditionally would delete one the row still
+     * points at.
+     */
+    let previousUrl: string | null = null;
+    let uploadedKey: string | null = null;
+
+    if (image || dto.subject_url !== undefined) {
+      const current = await this.subjects.findOne({
+        where: { id },
+        select: { id: true, major_id: true, subject_url: true },
+      });
+      if (!current) throw new NotFoundException('Subject not found');
+      previousUrl = current.subject_url;
+
+      if (image) {
+        const ext = image.originalname.split('.').pop() ?? 'bin';
+        uploadedKey = `${current.major_id}/${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2)}.${ext}`;
+        try {
+          updates.subject_url = await this.storage.upload(
+            BUCKETS.SUBJECTS,
+            uploadedKey,
+            image.buffer,
+            image.mimetype,
+          );
+        } catch {
+          throw new InternalServerErrorException(
+            'Failed to upload subject image',
+          );
+        }
+      } else {
+        updates.subject_url = dto.subject_url?.trim() || null;
+      }
+    }
+
     try {
       await this.subjects.update({ id }, updates);
     } catch {
+      // The row never changed — don't leave the just-uploaded object orphaned.
+      if (uploadedKey) {
+        await this.storage.remove([`${BUCKETS.SUBJECTS}/${uploadedKey}`]);
+      }
       throw new InternalServerErrorException('Failed to update subject');
     }
-    return { message: 'Subject updated' };
+
+    // Unreachable once the row points somewhere else.
+    if (previousUrl && previousUrl !== updates.subject_url) {
+      await this.storage.remove([this.storage.extractKey(previousUrl)]);
+    }
+
+    return {
+      message: 'Subject updated',
+      subject_url: updates.subject_url ?? previousUrl ?? null,
+    };
   }
 
   async removeSubject(id: string) {
@@ -1165,9 +1397,12 @@ export class AdminService {
     return { message: 'File approved' };
   }
 
-  async rejectFile(fileId: string, reviewer: Reviewer, reason?: string) {
+  /** `reason` is required — see RejectDto. */
+  async rejectFile(fileId: string, reviewer: Reviewer, reason: string) {
     const file = await this.loadPendingFile(fileId, reviewer);
     if (!file) return { message: 'No pending file found' };
+
+    const why = reason.trim();
 
     // The row and its object are kept, unlike a rejected group: the file never
     // reached anyone else, and leaving it intact lets the uploader open it,
@@ -1178,7 +1413,7 @@ export class AdminService {
         { id: fileId },
         {
           status: 'rejected',
-          rejection_reason: reason ?? null,
+          rejection_reason: why,
           reviewed_by: reviewer.id,
         },
       );
@@ -1191,11 +1426,12 @@ export class AdminService {
       void this.notificationsService.create({
         user_id: file.upload.uploader_id,
         type: 'document_rejected',
-        message: `The file "${name}" you added to "${file.upload.title}" was not approved.${
-          reason ? ` Reason: ${reason}` : ''
-        }`,
-        key: reason ? 'fileRejectedReason' : 'fileRejected',
-        params: { name, title: file.upload.title, reason: reason ?? '' },
+        message: `The file "${name}" you added to "${file.upload.title}" was not approved. Reason: ${why}`,
+        // The reason-less variants of these keys are kept in the locale files
+        // on purpose: rows written before the reason was mandatory still carry
+        // them, and dropping the translations would blank those notifications.
+        key: 'fileRejectedReason',
+        params: { name, title: file.upload.title, reason: why },
         ref_id: file.upload_id,
         ref_type: 'document',
       });
@@ -1204,11 +1440,14 @@ export class AdminService {
     return { message: 'File rejected' };
   }
 
+  /** `reason` is required — see RejectDto. */
   async rejectDocumentGroup(
     uploadId: string,
     reviewer: Reviewer,
-    reason?: string,
+    reason: string,
   ) {
+    const why = reason.trim();
+
     const upload = await this.uploads.findOne({
       where: { id: uploadId, status: 'pending' },
       select: { id: true, title: true, uploader_id: true, major_id: true },
@@ -1217,26 +1456,49 @@ export class AdminService {
     if (!upload) return { message: 'No pending upload found' };
     this.moderation.assertCanModerate(reviewer, upload.major_id);
 
-    // Delete all files from storage
     const files = await this.documents.find({
       where: { upload_id: uploadId },
-      select: { file_url: true },
+      select: { id: true },
     });
-    const keys = files
-      .map((f) => this.storage.extractKey(f.file_url))
-      .filter((k): k is string => k !== null);
-    if (keys.length) await this.storage.remove(keys);
 
+    /**
+     * The upload and its files move together, in one transaction.
+     *
+     * Only the upload row used to be marked, which left its files reading
+     * 'active' underneath a rejected upload — rows claiming to be live whose
+     * bytes were already deleted. Nothing noticed, because every lookup checks
+     * the upload's status first, but any query that filtered files by their own
+     * status would have taken them for real.
+     *
+     * The files are NOT deleted from storage here. They are kept for the
+     * retention window and removed by purgeRejectedUploads, so a rejection can
+     * be questioned, or reversed, while the bytes still exist.
+     */
+    const rejectedAt = new Date();
     try {
-      await this.uploads.update(
-        { id: uploadId },
-        {
-          status: 'rejected',
-          rejection_reason: reason ?? null,
-          rejected_at: new Date(),
-          reviewed_by: reviewer.id,
-        },
-      );
+      await this.uploads.manager.transaction(async (tx) => {
+        await tx.update(
+          Upload,
+          { id: uploadId },
+          {
+            status: 'rejected',
+            rejection_reason: why,
+            rejected_at: rejectedAt,
+            reviewed_by: reviewer.id,
+          },
+        );
+
+        if (files.length)
+          await tx.update(
+            DocumentFile,
+            { upload_id: uploadId },
+            {
+              status: 'rejected',
+              rejection_reason: why,
+              reviewed_by: reviewer.id,
+            },
+          );
+      });
     } catch {
       throw new InternalServerErrorException('Failed to reject upload');
     }
@@ -1250,10 +1512,11 @@ export class AdminService {
         // Names the document when there is only one, matching the approval.
         message:
           fileCount > 1
-            ? `Your ${fileCount} documents were not approved.${reason ? ` Reason: ${reason}` : ''}`
-            : `Your document "${upload.title}" was not approved.${reason ? ` Reason: ${reason}` : ''}`,
-        key: `${fileCount > 1 ? 'documentsRejected' : 'documentRejected'}${reason ? 'Reason' : ''}`,
-        params: { title: upload.title, count: fileCount, reason: reason ?? '' },
+            ? `Your ${fileCount} documents were not approved. Reason: ${why}`
+            : `Your document "${upload.title}" was not approved. Reason: ${why}`,
+        key:
+          fileCount > 1 ? 'documentsRejectedReason' : 'documentRejectedReason',
+        params: { title: upload.title, count: fileCount, reason: why },
         ref_id: uploadId,
         ref_type: 'document',
       });
@@ -1263,6 +1526,57 @@ export class AdminService {
   }
 
   // ─── Admin delete upload ───────────────────────────────────────────────────
+
+  /**
+   * Delete the files of uploads rejected longer ago than the retention window.
+   *
+   * Rejection keeps the bytes so a decision can be questioned; this is what
+   * eventually makes it real. Driven by the hourly sweep in AdminScheduler.
+   *
+   * Rows are CLAIMED before anything is deleted — one UPDATE that stamps
+   * `files_purged_at` and returns what it stamped. Production runs two backend
+   * replicas, so both fire this cron: without the claim they would both read
+   * the same batch and both try to delete it. The stamp is the lock, and
+   * Postgres settles the race.
+   *
+   * If storage then refuses, the claim is released so the next sweep retries.
+   * The alternative — leaving it stamped — would quietly abandon those objects
+   * in the bucket with nothing left pointing at them.
+   */
+  async purgeRejectedUploads(now: Date = new Date()) {
+    const cutoff = new Date(now.getTime() - REJECTED_FILE_RETENTION_MS);
+
+    const claim = await this.uploads
+      .createQueryBuilder()
+      .update(Upload)
+      .set({ files_purged_at: now })
+      .where('status = :rejected', { rejected: 'rejected' })
+      .andWhere('files_purged_at IS NULL')
+      .andWhere('rejected_at IS NOT NULL')
+      .andWhere('rejected_at <= :cutoff', { cutoff })
+      .returning('id')
+      .execute();
+
+    const ids = (claim.raw as { id: string }[]).map((row) => row.id);
+    if (!ids.length) return { purged: 0, files: 0 };
+
+    const files = await this.documents.find({
+      where: { upload_id: In(ids) },
+      select: { file_url: true },
+    });
+    const keys = files
+      .map((f) => this.storage.extractKey(f.file_url))
+      .filter((k): k is string => k !== null);
+
+    try {
+      if (keys.length) await this.storage.remove(keys);
+    } catch (err) {
+      await this.uploads.update({ id: In(ids) }, { files_purged_at: null });
+      throw err;
+    }
+
+    return { purged: ids.length, files: keys.length };
+  }
 
   async deleteDocument(uploadId: string) {
     const upload = await this.uploads.findOne({

@@ -105,20 +105,17 @@ export class UsersService {
     // The only promotion rule there is, now that the automatic July rollover is
     // gone. Tracked by instant rather than by year, so a second rollover inside
     // the same academic year still counts.
-    const rolloverDue = isRolloverDue(rolloverAt, user.promoted_rollover_at);
+    const rolloverDue = isRolloverDue(
+      rolloverAt,
+      user.promoted_rollover_at,
+      new Date(),
+      user.created_at,
+    );
 
-    if (!rolloverDue) {
-      // Nothing owed. Record where the schedule stands the first time we see
-      // this account, so a rollover set before they existed never applies.
-      if (user.promoted_rollover_at === null && rolloverAt) {
-        await this.users.update(
-          { id: user.id },
-          { promoted_rollover_at: rolloverAt },
-        );
-        user.promoted_rollover_at = rolloverAt;
-      }
-      return user;
-    }
+    // Nothing owed. Deliberately no write here: an unstamped account is one
+    // that has not had this rollover yet, and recording the schedule against
+    // it before the moment arrives is what used to skip the student entirely.
+    if (!rolloverDue) return user;
 
     // Foundation year 2: leave the stamp STALE on purpose. It is what getMe
     // reads to decide whether to ask, so stamping here would close out the

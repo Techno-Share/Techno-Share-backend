@@ -35,9 +35,23 @@ export function isRolloverDue(
   rolloverAt: Date | null,
   appliedAt: Date | null,
   now = new Date(),
+  /**
+   * When the account was created. A rollover that fired before the student
+   * existed is not theirs to receive — they were not here for that year.
+   *
+   * This used to be handled by stamping `promoted_rollover_at` on first sight
+   * of an unstamped account, which was wrong twice over: that branch could
+   * only ever be reached for a rollover still in the FUTURE (a past one with
+   * no stamp is simply due), so it never protected a new account from an old
+   * rollover — and what it did instead was consume the upcoming one, leaving
+   * `appliedAt === rolloverAt` so the student was skipped when the moment
+   * finally came. Expressed as a comparison, it needs no write at all.
+   */
+  createdAt: Date | null = null,
 ): boolean {
   if (!rolloverAt) return false;
   if (rolloverAt > now) return false; // scheduled, not yet reached
+  if (createdAt && rolloverAt <= createdAt) return false; // predates the account
   return !appliedAt || appliedAt < rolloverAt;
 }
 

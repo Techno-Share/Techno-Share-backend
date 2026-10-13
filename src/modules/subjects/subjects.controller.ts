@@ -43,7 +43,8 @@ export class SubjectsController {
 
   /**
    * GET /subjects?major_id=<uuid>
-   * Public — used to populate subject dropdowns filtered by major
+   * Public — used to populate subject dropdowns filtered by major.
+   *
    */
   @RateLimitTier('search')
   @Get()

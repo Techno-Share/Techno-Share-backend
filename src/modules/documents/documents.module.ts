@@ -11,6 +11,7 @@ import { StagedFile } from './entities/staged-file.entity';
 import { UploadPin } from './entities/upload-pin.entity';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RateLimitModule } from '../../common/rate-limit/rate-limit.module';
+import { AdminModule } from '../admin/admin.module';
 
 @Module({
   imports: [
@@ -28,6 +29,10 @@ import { RateLimitModule } from '../../common/rate-limit/rate-limit.module';
     // For the per-user upload byte budget. StorageModule is @Global, so
     // StorageService and ImageOptimizeService need no import here.
     RateLimitModule,
+    // For ModerationService: an upload by someone who may approve that
+    // department is approved on the spot. AdminModule does not import this
+    // one, so the dependency is one-way.
+    AdminModule,
   ],
   controllers: [DocumentsController],
   providers: [DocumentsService],

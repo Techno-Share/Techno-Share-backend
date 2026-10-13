@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AdminController } from './admin.controller';
 import { ModerationController } from './moderation.controller';
 import { AdminService } from './admin.service';
+import { AdminScheduler } from './admin.scheduler';
 import { ModerationService } from './moderation.service';
 import { AdminGuard } from './guards/admin.guard';
 import { ReviewerGuard } from './guards/reviewer.guard';
@@ -41,7 +42,13 @@ import { Major } from '../majors/entities/major.entity';
     SettingsModule,
   ],
   controllers: [AdminController, ModerationController],
-  providers: [AdminService, ModerationService, AdminGuard, ReviewerGuard],
+  providers: [
+    AdminService,
+    AdminScheduler,
+    ModerationService,
+    AdminGuard,
+    ReviewerGuard,
+  ],
   exports: [ModerationService],
 })
 export class AdminModule {}
