@@ -14,6 +14,7 @@ import { pgCode, errMessage } from '../../common/utils/pg-error';
 import { CreateSubjectDto } from './dto/create-subject.dto';
 import { UpdateSubjectDto } from './dto/update-subject.dto';
 import { acronymFromName } from '../../common/utils/acronym';
+import { ModerationService } from '../admin/moderation.service';
 import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
@@ -23,6 +24,7 @@ export class SubjectsService {
     private readonly subjects: Repository<Subject>,
     private readonly storage: StorageService,
     private readonly notifications: NotificationsService,
+    private readonly moderation: ModerationService,
   ) {}
 
   async countsByMajor(majorId: string): Promise<Record<number, number>> {
@@ -63,9 +65,12 @@ export class SubjectsService {
         's.subject_url',
       ])
       .where('s.major_id = :majorId', { majorId })
-      .andWhere('s.status = :status', { status: 'active' })
-      .orderBy('s.semester', 'ASC')
-      .addOrderBy('s.subject_url', 'ASC', 'NULLS LAST');
+      // Approved only. Nothing is ever created pending now, and the rows that
+      // predate that change were published with it.
+      .andWhere('s.status = :active', { active: 'active' })
+      // Alphabetical. Was semester, then subject_url — which sorted by image
+      // URL, so whether a subject had a cover decided where it sat.
+      .orderBy('s.name', 'ASC');
 
     if (yearLevel && yearLevel > 0)
       qb.andWhere('s.year_level = :yearLevel', { yearLevel });
@@ -86,6 +91,22 @@ export class SubjectsService {
     image?: Express.Multer.File,
     submittedBy?: string,
   ) {
+    /**
+     * Adding a subject is a curation decision, not a contribution: it defines
+     * what the department's shelves ARE, and a wrong or duplicated one is seen
+     * by everybody until someone tidies it. So it is limited to the people who
+     * already decide that — an admin anywhere, a moderator inside the
+     * departments they moderate.
+     *
+     * Checked against the department being written to, never against a role on
+     * the request, so a moderator of GIC cannot add a subject to GTR.
+     */
+    const reviewer = await this.moderation.resolveReviewer(submittedBy ?? '');
+    if (!this.moderation.canModerate(reviewer, dto.major_id)) {
+      throw new ForbiddenException(
+        'Only a moderator of this department can add a subject to it',
+      );
+    }
     const subjectUrl = dto.subject_url?.trim();
 
     let uploadedImageUrl: string | null = null;
@@ -126,26 +147,20 @@ export class SubjectsService {
           year_level: dto.year_level,
           semester: dto.semester,
           subject_url: finalSubjectUrl,
-          status: 'pending',
+          // Everyone who may create one may also approve it, so there is
+          // nothing left to review — the same rule uploads follow. Keeping it
+          // pending would mean the creator approving their own subject one
+          // click later, which is a ritual rather than a control.
+          status: 'active',
           submitted_by: submittedBy ?? null,
         }),
       );
 
       /**
-       * Tell whoever reviews this department. Not awaited: the subject is
-       * already saved, and a notification that fails is not a reason to report
-       * the submission as failed.
+       * No "waiting for review" notice: nothing is waiting. It was telling the
+       * department's moderators about a subject that is already part of the
+       * course, which is a queue entry with nothing in it.
        */
-      void this.notifications.createForReviewers({
-        major_id: saved.major_id,
-        type: 'subject_pending',
-        message: `A new subject "${saved.name}" is waiting for review.`,
-        key: 'subjectPending',
-        params: { name: saved.name },
-        ref_id: saved.id,
-        ref_type: 'subject',
-        except_user_id: submittedBy ?? undefined,
-      });
 
       return {
         id: saved.id,
@@ -183,10 +198,13 @@ export class SubjectsService {
         .createQueryBuilder('s')
         .leftJoinAndSelect('s.major', 'major')
         .where('s.submitted_by = :userId', { userId })
-        .andWhere('s.status IN (:...statuses)', {
-          statuses: ['pending', 'rejected'],
-        })
-        .orderBy('s.id', 'DESC')
+        // Only the leftovers: a subject created now is active at once, so this
+        // can return nothing but rows left pending when review was removed.
+        .andWhere('s.status = :pending', { pending: 'pending' })
+        // Newest first. Was `s.id DESC`, which orders by uuid — meaningless,
+        // and it made your own submissions list look shuffled.
+        .orderBy('s.created_at', 'DESC')
+        .addOrderBy('s.id', 'DESC')
         .getMany();
     } catch {
       throw new InternalServerErrorException('Failed to fetch your subjects');
@@ -200,8 +218,6 @@ export class SubjectsService {
       semester: s.semester,
       subject_url: s.subject_url,
       status: s.status,
-      rejection_reason: s.rejection_reason,
-      rejected_at: s.rejected_at,
       created_at: s.created_at,
       majors: s.major ? { id: s.major.id, acronym: s.major.acronym } : null,
     }));
@@ -210,14 +226,26 @@ export class SubjectsService {
   async updateOwn(id: string, userId: string, dto: UpdateSubjectDto) {
     const existing = await this.subjects.findOne({
       where: { id },
-      select: { id: true, submitted_by: true, status: true },
+      select: { id: true, submitted_by: true, status: true, major_id: true },
     });
 
     if (!existing) throw new NotFoundException('Subject not found');
-    if (existing.submitted_by !== userId)
-      throw new ForbiddenException('Not your subject');
-    if (existing.status === 'active')
-      throw new ForbiddenException('Cannot edit an approved subject');
+    /**
+     * Curation, start to finish: whoever may ADD a subject to a department may
+     * also fix or remove one.
+     *
+     * Was "your own, while it is still pending" — a rule that cannot survive
+     * the review flow going away. A subject is created active now, so the
+     * `status === 'active'` guard would have blocked the moderator who made it
+     * one second earlier; and the legacy pending rows, once published, would
+     * have left the students who proposed them able to edit live subjects.
+     */
+    const reviewer = await this.moderation.resolveReviewer(userId);
+    if (!this.moderation.canModerate(reviewer, existing.major_id)) {
+      throw new ForbiddenException(
+        'Only a moderator of this department can change its subjects',
+      );
+    }
 
     const updates: Partial<Subject> = {};
     if (dto.name !== undefined) {
@@ -253,14 +281,26 @@ export class SubjectsService {
   async removeOwn(id: string, userId: string) {
     const existing = await this.subjects.findOne({
       where: { id },
-      select: { id: true, submitted_by: true, status: true },
+      select: { id: true, submitted_by: true, status: true, major_id: true },
     });
 
     if (!existing) throw new NotFoundException('Subject not found');
-    if (existing.submitted_by !== userId)
-      throw new ForbiddenException('Not your subject');
-    if (existing.status === 'active')
-      throw new ForbiddenException('Cannot delete an approved subject');
+    /**
+     * Curation, start to finish: whoever may ADD a subject to a department may
+     * also fix or remove one.
+     *
+     * Was "your own, while it is still pending" — a rule that cannot survive
+     * the review flow going away. A subject is created active now, so the
+     * `status === 'active'` guard would have blocked the moderator who made it
+     * one second earlier; and the legacy pending rows, once published, would
+     * have left the students who proposed them able to edit live subjects.
+     */
+    const reviewer = await this.moderation.resolveReviewer(userId);
+    if (!this.moderation.canModerate(reviewer, existing.major_id)) {
+      throw new ForbiddenException(
+        'Only a moderator of this department can change its subjects',
+      );
+    }
 
     try {
       await this.subjects.delete({ id });

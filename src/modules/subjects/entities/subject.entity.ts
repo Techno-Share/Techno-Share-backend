@@ -37,7 +37,12 @@ export class Subject {
   @Column({ type: 'text', nullable: true })
   subject_url: string | null;
 
-  @Column({ type: 'text', default: 'pending' })
+  /**
+   * 'active' for everything created now. Legacy rows may still read 'pending'
+   * or 'rejected' from the review era; both are invisible, since every lookup
+   * filters to active.
+   */
+  @Column({ type: 'text', default: 'active' })
   status: string;
 
   @Column({ type: 'uuid', nullable: true })
@@ -47,13 +52,12 @@ export class Subject {
   @JoinColumn({ name: 'submitted_by' })
   submitter: User | null;
 
-  @Column({ type: 'text', nullable: true })
-  rejection_reason: string | null;
-
-  @Column({ type: 'timestamptz', nullable: true })
-  rejected_at: Date | null;
-
-  /** Who approved or rejected it; null until reviewed. */
+  /**
+   * Left from the review era, when a subject was approved or rejected by a
+   * moderator. Nothing writes it now — a subject is created by a moderator of
+   * its own department and is active immediately. Kept only because the column
+   * still exists for rows written before that change.
+   */
   @Column({ type: 'uuid', nullable: true })
   reviewed_by: string | null;
 

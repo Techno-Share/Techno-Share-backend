@@ -22,7 +22,8 @@ import { OfficeConvertService } from '../storage/office-convert.service';
 import { pgCode } from '../../common/utils/pg-error';
 import { LANGUAGE_MAJOR_ACRONYMS } from './constants/majors';
 import { decodeUploadName } from './utils/upload-name';
-import { yearLevelsForMajor } from './utils/year-levels';
+import { isFoundationMajor, yearLevelsForMajor } from './utils/year-levels';
+import { ModerationService } from '../admin/moderation.service';
 import {
   CreateDocumentDto,
   DEPARTMENT_DOC_TYPES,
@@ -62,6 +63,7 @@ export class DocumentsService {
     @InjectRepository(User)
     private readonly users: Repository<User>,
     private readonly notifications: NotificationsService,
+    private readonly moderation: ModerationService,
     @InjectRepository(Major)
     private readonly majors: Repository<Major>,
     @InjectRepository(UploadPin)
@@ -224,9 +226,9 @@ export class DocumentsService {
     viewer: {
       id: string;
       role: string;
-      major_id: string | null;
-      year_level: number | null;
     },
+    /** Every (department, year) the viewer has been in — see viewerCohorts. */
+    cohorts: { major_id: string; year_level: number }[],
     // When true (the owner listing their own uploads — the dashboard), expired
     // uploads are kept. In the browse feed it's false, so expiry hides a doc
     // from EVERYONE including its uploader; the owner only sees it again in the
@@ -248,10 +250,29 @@ export class DocumentsService {
       return;
     }
 
-    // Not expired AND the viewer either uploaded it or their own (department,
-    // year) is one of the pairs the audience lists. An empty array is no
+    // Not expired AND the viewer either uploaded it or ANY cohort they have
+    // been in is among the pairs the audience lists. An empty array is no
     // restriction — which is also what language-course uploads always store,
     // since every student takes those.
+    //
+    // One `@>` per cohort, OR'd, rather than a single containment of the whole
+    // list: `@>` asks whether the audience contains EVERY element given, and
+    // the question here is whether it contains ANY. Each term still uses the
+    // jsonb_path_ops GIN index on uploads.audience.
+    const params: Record<string, unknown> = {
+      includeExpired,
+      viewerId: viewer.id,
+    };
+    const cohortTerms = cohorts.map((cohort, i) => {
+      params[`cohort${i}`] = JSON.stringify([cohort]);
+      return `u.audience @> :cohort${i}::jsonb`;
+    });
+    // A profile with no department/year matches nothing rather than
+    // accidentally satisfying a restricted upload.
+    const audienceMatch = cohortTerms.length
+      ? `OR ${cohortTerms.join(' OR ')}`
+      : '';
+
     qb.andWhere(
       `(
         ${notExpired}
@@ -259,33 +280,19 @@ export class DocumentsService {
         AND (
           u.uploader_id = :viewerId
           OR jsonb_array_length(u.audience) = 0
-          OR u.audience @> :viewerAudience::jsonb
+          ${audienceMatch}
         )
       )`,
-      {
-        includeExpired,
-        viewerId: viewer.id,
-        // A profile with no department/year gets a pair that can never match,
-        // rather than accidentally satisfying a restricted upload.
-        viewerAudience: JSON.stringify([
-          {
-            major_id: viewer.major_id ?? '00000000-0000-0000-0000-000000000000',
-            year_level: viewer.year_level ?? -1,
-          },
-        ]),
-      },
+      params,
     );
   }
 
   /** True if `viewer` may see an already-loaded upload (detail endpoint). */
   private canView(
     upload: Upload,
-    viewer: {
-      id: string;
-      role: string;
-      major_id: string | null;
-      year_level: number | null;
-    },
+    viewer: { id: string; role: string },
+    /** Every (department, year) the viewer has been in — see viewerCohorts. */
+    cohorts: { major_id: string; year_level: number }[],
   ): boolean {
     if (viewer.role === 'admin') return true;
     if (upload.uploader_id === viewer.id) return true;
@@ -296,10 +303,14 @@ export class DocumentsService {
     if (upload.hidden_at) return false;
     const audience = upload.audience ?? [];
     if (!audience.length) return true; // no restriction
-    return audience.some(
-      (entry) =>
-        entry.major_id === viewer.major_id &&
-        entry.year_level === viewer.year_level,
+    // Any cohort they have been in, not just the one they are in now — the
+    // same rule applyVisibility applies to the feed.
+    return audience.some((entry) =>
+      cohorts.some(
+        (cohort) =>
+          entry.major_id === cohort.major_id &&
+          entry.year_level === cohort.year_level,
+      ),
     );
   }
 
@@ -381,12 +392,99 @@ export class DocumentsService {
   private async getViewer(viewerId: string) {
     const user = await this.users.findOne({
       where: { id: viewerId },
-      select: { id: true, role: true, major_id: true, year_level: true },
+      // The major's acronym comes along because the cohorts a student has
+      // passed through are derived from it — a department runs 3–5, the
+      // foundation programme 1–2, and the rule differs per kind.
+      relations: { major: true },
+      select: {
+        id: true,
+        role: true,
+        major_id: true,
+        year_level: true,
+        major: { id: true, acronym: true },
+      },
     });
     // Fall back to a least-privilege viewer if the id somehow isn't found.
     return (
-      user ?? { id: viewerId, role: 'user', major_id: null, year_level: null }
+      user ?? {
+        id: viewerId,
+        role: 'user',
+        major_id: null,
+        year_level: null,
+        major: null,
+      }
     );
+  }
+
+  /**
+   * How long the foundation-major lookup is reused.
+   *
+   * It is read on every feed request but changes about never — a department is
+   * created by an admin, by hand. A minute keeps it off the hot path without
+   * making a newly-created foundation major wait for a restart.
+   */
+  private static readonly FOUNDATION_TTL_MS = 60_000;
+  private foundationCache: { at: number; majors: Major[] } | null = null;
+
+  /** The foundation programme's majors (TC, and the older FOUNDATION row). */
+  private async foundationMajors(): Promise<Major[]> {
+    const now = Date.now();
+    if (
+      this.foundationCache &&
+      now - this.foundationCache.at < DocumentsService.FOUNDATION_TTL_MS
+    )
+      return this.foundationCache.majors;
+
+    const all = await this.majors.find({ select: { id: true, acronym: true } });
+    const majors = all.filter((m) => isFoundationMajor(m.acronym));
+    this.foundationCache = { at: now, majors };
+    return majors;
+  }
+
+  /**
+   * Every (department, year) this viewer has been in — not only the one they
+   * are in today.
+   *
+   * A student promoted into year 4 was in year 3 last year, and in the
+   * foundation programme before that. Matching on the current cohort alone
+   * meant promotion silently took away the material they had been using all
+   * year: their own course's notes, their own past exams. Nothing was deleted
+   * and nothing said anything; the documents simply stopped appearing.
+   *
+   * Derived rather than recorded. There is no history table, and the
+   * progression is fixed — a department takes students from year 3 to 5, and
+   * everyone reaches it through the foundation years — so "where has this
+   * person been" is a function of where they are now. A transfer between
+   * departments is the case this does not cover; it is rare, and the
+   * alternative is a membership table nothing else would use.
+   */
+  private async viewerCohorts(viewer: {
+    major_id: string | null;
+    year_level: number | null;
+    major?: { acronym: string } | null;
+  }): Promise<{ major_id: string; year_level: number }[]> {
+    const acronym = viewer.major?.acronym;
+    if (!viewer.major_id || viewer.year_level == null || !acronym) return [];
+
+    const cohorts: { major_id: string; year_level: number }[] = [];
+
+    // Their own department, every year up to and including the current one.
+    for (const year of yearLevelsForMajor(acronym)) {
+      if (year <= viewer.year_level)
+        cohorts.push({ major_id: viewer.major_id, year_level: year });
+    }
+
+    // Everyone in a department came through the foundation programme, so its
+    // years are part of their past too. A student still IN it has already had
+    // those years covered by the loop above.
+    if (!isFoundationMajor(acronym)) {
+      for (const foundation of await this.foundationMajors()) {
+        for (const year of yearLevelsForMajor(foundation.acronym))
+          cohorts.push({ major_id: foundation.id, year_level: year });
+      }
+    }
+
+    return cohorts;
   }
 
   // ─── Staged files ──────────────────────────────────────────────────────────
@@ -437,7 +535,7 @@ export class DocumentsService {
     const originalName = decodeUploadName(file.originalname);
 
     // Charged against the bytes RECEIVED, not the bytes kept, and charged
-    // before anything expensive happens. Sharp can shrink a 20 MB photo to
+    // before anything expensive happens. Sharp can shrink a 50 MB photo to
     // 200 KB, so billing the stored size would leave the exact abuse this
     // exists for — pushing volume at the server — effectively unbounded.
     // Reserving first also means a refusal costs no decode. A file rejected
@@ -632,6 +730,28 @@ export class DocumentsService {
 
   // ─── Upload ────────────────────────────────────────────────────────────────
 
+  /**
+   * Whether this uploader may publish into this department without review.
+   *
+   * The review queue exists to catch material from people who cannot vet their
+   * own — it was never a four-eyes control here, because assertCanModerate
+   * checks only the department: a moderator's own upload landed in their own
+   * queue and they approved it themselves one click later. Requiring that
+   * click added no safety, cluttered the queue they triage students' work in,
+   * and inflated the pending badge.
+   *
+   * Admins qualify everywhere; a moderator only inside the departments they
+   * actually moderate. A moderator uploading to someone else's department is
+   * an ordinary student there and still waits.
+   */
+  private async publishesWithoutReview(
+    uploaderId: string,
+    majorId: string,
+  ): Promise<boolean> {
+    const reviewer = await this.moderation.resolveReviewer(uploaderId);
+    return this.moderation.canModerate(reviewer, majorId);
+  }
+
   async uploadMany(
     uploaderId: string,
     dto: CreateDocumentDto,
@@ -645,6 +765,12 @@ export class DocumentsService {
     const major = await this.loadMajor(dto.major_id);
     this.assertDocType(major, dto.doc_type);
     const audience = await this.resolveAudience(major, dto.audience ?? []);
+
+    // Decided before the row is written, so status and reviewed_by agree.
+    const autoApprove = await this.publishesWithoutReview(
+      uploaderId,
+      dto.major_id,
+    );
 
     const firstName =
       (decodeUploadName(files?.[0]?.originalname) ||
@@ -668,7 +794,11 @@ export class DocumentsService {
           academic_year: dto.academic_year ?? null,
           ...audience,
           expires_at: dto.expires_at ? new Date(dto.expires_at) : null,
-          status: 'pending',
+          status: autoApprove ? 'active' : 'pending',
+          // Stamped even when nobody clicked Approve: an active upload with no
+          // reviewer is indistinguishable from one that skipped review by
+          // mistake, and the history is what tells them apart later.
+          ...(autoApprove ? { reviewed_by: uploaderId } : {}),
         }),
       );
     } catch (err) {
@@ -704,16 +834,20 @@ export class DocumentsService {
       `${uploader?.first_name ?? ''} ${uploader?.last_name ?? ''}`.trim() ||
       'A student';
 
-    void this.notifications.createForReviewers({
-      major_id: dto.major_id,
-      type: 'document_pending',
-      message: `${uploaderName} submitted "${title}" for review.`,
-      key: 'documentPending',
-      params: { name: uploaderName, title },
-      ref_id: upload.id,
-      ref_type: 'upload',
-      except_user_id: uploaderId,
-    });
+    // Nothing to review, so nobody is told. Sending it anyway would put an
+    // already-published document in every other moderator's queue notice.
+    if (!autoApprove) {
+      void this.notifications.createForReviewers({
+        major_id: dto.major_id,
+        type: 'document_pending',
+        message: `${uploaderName} submitted "${title}" for review.`,
+        key: 'documentPending',
+        params: { name: uploaderName, title },
+        ref_id: upload.id,
+        ref_type: 'upload',
+        except_user_id: uploaderId,
+      });
+    }
 
     return { upload_id: upload.id, files: fileResults };
   }
@@ -849,7 +983,7 @@ export class DocumentsService {
 
     // 1. May this viewer see the parent upload at all? Audience, expiry and
     //    hidden state all live in canView, reused rather than restated.
-    if (!this.canView(upload, viewer))
+    if (!this.canView(upload, viewer, await this.viewerCohorts(viewer)))
       throw new NotFoundException('File not found');
 
     // 2. Is the upload itself published? A pending or rejected upload belongs
@@ -991,6 +1125,12 @@ export class DocumentsService {
           rejection_reason: d.rejection_reason,
           /** Non-null when the uploader has hidden this file specifically. */
           hidden_at: d.hidden_at,
+          /**
+           * This file's own age, not its upload's. A file added later to an
+           * existing folder used to inherit the folder's date and read as old
+           * as it — see AddDocumentCreatedAt.
+           */
+          created_at: d.created_at,
         })),
       ),
     };
@@ -1060,13 +1200,26 @@ export class DocumentsService {
       .leftJoinAndSelect('u.uploader', 'uploader')
       .leftJoinAndSelect('u.major', 'major')
       .leftJoinAndSelect('u.subject', 'subject')
-      // A pending file is invisible in the feed even to its own uploader — the
-      // count on a feed card should say what the public can actually open. The
-      // uploader sees it, marked, on the detail page.
+      /**
+       * A pending file is invisible in the feed even to its own uploader — the
+       * count on a feed card should say what the public can actually open. The
+       * uploader sees it, marked, on the detail page.
+       *
+       * That holds for a PUBLISHED upload. On an unpublished one every file
+       * comes back, whatever its status: only the owner is served such an
+       * upload at all (see the status clause below), and filtering to 'active'
+       * there hands them a folder that reports zero files.
+       *
+       * Not hypothetical. Rejecting an upload now marks its files rejected with
+       * it, so this join started returning nothing for them — and the edit
+       * form, which lists `doc.documents` as the files you already have, opened
+       * empty on the very upload you were trying to fix and resubmit.
+       */
       .leftJoinAndSelect(
         'u.documents',
         'documents',
-        'documents.status = :ok AND documents.hidden_at IS NULL',
+        `(documents.status = :ok AND documents.hidden_at IS NULL)
+           OR u.status <> :ok`,
         { ok: 'active' },
       )
       // Non-active statuses are only honoured when you are listing your OWN
@@ -1077,20 +1230,55 @@ export class DocumentsService {
       // statuses" filter sends nothing, and defaulting to 'active' there hid
       // your own pending and rejected uploads from the one screen that exists
       // to show you what happened to them.
+      /**
+       * Three cases, deliberately separated:
+       *
+       *  - your own list with no filter -> every status, because that screen
+       *    exists to tell you what happened to what you posted;
+       *  - your own list with a filter  -> exactly that status;
+       *  - anyone else's view           -> approved uploads, PLUS your own
+       *    still awaiting review.
+       *
+       * That last addition mirrors the subject list: a document you submitted
+       * otherwise vanished from the subject page until a moderator acted,
+       * which reads as the upload having been lost. It is scoped to the
+       * uploader, so `?status=pending` still cannot expose anyone else's
+       * unreviewed work. Rejected stays out — that belongs on the dashboard,
+       * where the reason is shown.
+       */
       .where(
         ownList && !query.status
           ? 'u.status IN (:...statuses)'
-          : 'u.status = :status',
+          : ownList
+            ? 'u.status = :status'
+            : `(u.status = :status OR (u.status = 'pending' AND u.uploader_id = :ownerId))`,
         ownList && !query.status
           ? { statuses: ['active', 'pending', 'rejected'] }
-          : { status: ownList ? query.status : 'active' },
+          : ownList
+            ? { status: query.status }
+            : { status: 'active', ownerId: viewerId },
       )
-      // Filtered in SQL, not after the fact, so paging stays correct. An upload
-      // reaches zero approved files only if its last approved one was deleted
-      // while a pending file remained; it comes back the moment that file is
-      // cleared. Without this it would list as an empty folder.
+      /**
+       * Don't list an upload that would render as an empty folder.
+       *
+       * Scoped to PUBLISHED uploads, which is the only place the question
+       * arises: an active upload reaches zero approved files when its last one
+       * was deleted while a pending file remained, and it comes back the moment
+       * that file is cleared.
+       *
+       * A pending or rejected upload has no approved files by definition, so
+       * applying the same test to it hides it from the one person entitled to
+       * see it. That is not hypothetical — rejecting an upload now marks its
+       * files rejected along with it, and this clause promptly emptied the
+       * owner's "Not approved" tab. Their files are still there; being rejected
+       * is what the owner opened the tab to look at.
+       */
       .andWhere(
-        'exists (select 1 from documents d where d.upload_id = u.id and d.status = :ok and d.hidden_at is null)',
+        `(u.status <> :ok
+          OR exists (select 1 from documents d
+                      where d.upload_id = u.id
+                        and d.status = :ok
+                        and d.hidden_at is null))`,
       )
       // Filtered to the viewer, so it can only ever attach their own pin: the
       // join both feeds `pinned_at` back to the client and drives the sort.
@@ -1107,24 +1295,51 @@ export class DocumentsService {
     // Your pins lead every listing you look at — the feed, a subject page.
     // Because the join is filtered to you, this reorders nothing for anyone
     // else: two people opening the same subject see the same documents in the
-    // order each of them chose.
-    //
-    // orderBy(), not addOrderBy(): the builder already sorts by uploaded_at, and
-    // appending would leave the pin as a tie-breaker that never breaks a tie.
-    //
-    // ?sort=date opts out. The owner's dashboard is a record of what they
-    // uploaded and when, and a pinned row jumping to the top of it makes the
-    // date column look unsorted. The pin JOIN stays either way — it also feeds
-    // `pinned_at` back to the client for the pin/unpin menu.
+    // order each of them chose. The pin JOIN stays in place under every sort —
+    // it also feeds `pinned_at` back to the client for the pin/unpin menu.
+    /**
+     * Your own uploads still awaiting review come first — except under
+     * ?sort=date.
+     *
+     * They are the rows waiting on somebody else, and they leave the moment a
+     * moderator acts, so floating them up is worth it in a browsing listing.
+     * Only the uploader is ever served a pending row (see the status clause
+     * above), so for every other reader this expression is constant and the
+     * order is unchanged.
+     *
+     * Ahead of the pin: a pin is a bookmark you placed deliberately and can
+     * find again, while a pending upload is a question you are waiting on an
+     * answer to.
+     *
+     * ?sort=date opts out of BOTH, for the same reason the pin does: it is
+     * asked for by the owner's dashboard table, which shows a Post Date column.
+     * Anything floating to the top there makes that column read as mis-sorted —
+     * a rejected upload from the 5th sitting below a pending one from the 4th
+     * looks like a bug, whatever the grouping behind it.
+     *
+     * Selected under an alias rather than written inline in ORDER BY: this
+     * query is paginated, and TypeORM paginates a joined query by selecting
+     * DISTINCT ids with the ORDER BY applied — Postgres refuses a SELECT
+     * DISTINCT whose ORDER BY names an expression outside the select list.
+     * Inline, this failed the whole feed with a 500.
+     */
     if (query.sort === 'date') {
       qb.orderBy('u.uploaded_at', 'DESC');
     } else {
-      qb.orderBy('pin.pinned_at', 'DESC', 'NULLS LAST').addOrderBy(
-        'u.uploaded_at',
-        'DESC',
+      qb.addSelect(
+        `CASE WHEN u.status = 'pending' THEN 0 ELSE 1 END`,
+        'pending_first',
       );
+      qb.orderBy('pending_first', 'ASC')
+        .addOrderBy('pin.pinned_at', 'DESC', 'NULLS LAST')
+        .addOrderBy('u.uploaded_at', 'DESC');
     }
-    this.applyVisibility(qb, viewer, includeExpired);
+    this.applyVisibility(
+      qb,
+      viewer,
+      await this.viewerCohorts(viewer),
+      includeExpired,
+    );
 
     if (query.major_id)
       qb.andWhere('u.major_id = :major_id', { major_id: query.major_id });
@@ -1173,7 +1388,18 @@ export class DocumentsService {
     try {
       const [rows, total] = await qb.getManyAndCount();
       return {
-        items: await Promise.all(rows.map((u) => this.toFeedShape(u))),
+        /**
+         * The viewer goes through, so visibleFiles can tell the uploader from
+         * a stranger. Without it every listed upload was shaped as if for the
+         * public: the JOIN above returned the owner's own pending and rejected
+         * files, and this filtered them straight back out, one line later.
+         *
+         * findOne always passed it, which is why a rejected upload showed its
+         * file on the detail page and none in the dashboard's edit form — the
+         * form reads the LISTED upload. Non-owners are unaffected: they are
+         * served only active uploads, whose files are active anyway.
+         */
+        items: await Promise.all(rows.map((u) => this.toFeedShape(u, viewer))),
         total,
         page,
         limit,
@@ -1221,15 +1447,31 @@ export class DocumentsService {
         viewerId,
       })
       .where('u.id = :id', { id: uploadId })
-      .andWhere('u.status = :status', { status: 'active' })
       .getOne();
 
     if (!upload) throw new NotFoundException('Document not found');
 
-    // Enforce audience restriction. Return 404 (not 403) so a restricted doc's
-    // existence isn't revealed to users outside its audience.
+    /**
+     * Status is NOT filtered in the query above, on purpose.
+     *
+     * It used to be `status = 'active'`, which meant an uploader opening their
+     * own pending submission got a 404 — their own document, from their own
+     * dashboard, reported as not existing. canView already answers this
+     * question and answers it better: the uploader and admins see a pending
+     * upload, nobody else does.
+     *
+     * Everyone else still gets 404 rather than 403, so a restricted document's
+     * existence is never revealed to someone outside its audience.
+     */
     const viewer = await this.getViewer(viewerId);
-    if (!this.canView(upload, viewer))
+    const cohorts = await this.viewerCohorts(viewer);
+    const isOwnerOrAdmin =
+      upload.uploader_id === viewer.id || viewer.role === 'admin';
+
+    if (upload.status !== 'active' && !isOwnerOrAdmin)
+      throw new NotFoundException('Document not found');
+
+    if (!this.canView(upload, viewer, cohorts))
       throw new NotFoundException('Document not found');
 
     return await this.toFeedShape(upload, viewer);
@@ -1256,6 +1498,24 @@ export class DocumentsService {
     if (!upload) throw new NotFoundException('Upload not found');
     if (upload.uploader_id !== userId)
       throw new ForbiddenException('Not your upload');
+
+    /**
+     * A rejected upload is closed.
+     *
+     * Editing one used to re-open it — status back to pending, reason cleared —
+     * so "Not approved" was a state the uploader could edit their way out of,
+     * erasing the moderator's decision with nothing recording that the thing
+     * they refused had since changed. Fixing a refused submission now means
+     * uploading it again, which leaves the refusal standing as its own record.
+     *
+     * Pending is different and still re-queues below: that decision has not
+     * been made, and an uploader correcting their own submission while it waits
+     * is what review is for.
+     */
+    if (upload.status === 'rejected')
+      throw new BadRequestException(
+        'This document was not approved and can no longer be edited. Upload it again if you have fixed the problem.',
+      );
 
     // Build the patch — only fields that were sent.
     const patch: Partial<Upload> = {};
@@ -1301,8 +1561,9 @@ export class DocumentsService {
       patch.expires_at = next;
     }
 
-    // Editing sends the upload back for review.
-    if (upload.status !== 'active') {
+    // Still under review: an edit re-queues it, so the reviewer judges the
+    // version the uploader actually wants judged. Rejected never reaches here.
+    if (upload.status === 'pending') {
       patch.status = 'pending';
       patch.rejection_reason = null;
     }
@@ -1341,15 +1602,30 @@ export class DocumentsService {
     if (upload.uploader_id !== userId)
       throw new ForbiddenException('Not your upload');
 
+    // Attaching a file is an edit — same closed door. See update().
+    if (upload.status === 'rejected')
+      throw new BadRequestException(
+        'This document was not approved and can no longer be changed. Upload it again if you have fixed the problem.',
+      );
+
     // A file added to an ALREADY-APPROVED upload has never been reviewed, so it
     // lands pending and stays hidden from everyone but its uploader. The upload
     // keeps its own status either way — hiding one new file is what stops an
     // approved document from leaving the feed over a single attachment.
     //
-    // On an upload that is still pending or rejected, the files are 'active':
-    // the upload's own review below covers everything in it as a group.
+    // On an upload still pending, the files are 'active': the upload's own
+    // review below covers everything in it as a group.
+    //
+    // Unless the uploader may approve this department themselves — the same
+    // rule uploadMany applies. Without this, a moderator who adds one file to
+    // their own published document puts it straight back in their own queue,
+    // which is the ritual the auto-approve exists to remove.
+    const selfApproves = await this.publishesWithoutReview(
+      userId,
+      upload.major_id,
+    );
     const fileStatus: DocumentStatus =
-      upload.status === 'active' ? 'pending' : 'active';
+      upload.status === 'active' && !selfApproves ? 'pending' : 'active';
 
     const results: unknown[] = stagedFileIds.length
       ? await this.claimStagedFiles(uploadId, userId, stagedFileIds, fileStatus)
@@ -1366,8 +1642,9 @@ export class DocumentsService {
       );
     }
 
-    // Editing sends the upload back for review.
-    if (upload.status !== 'active') {
+    // Still under review: keep it queued. Rejected never reaches here, so
+    // there are no refused files left to clear — see update().
+    if (upload.status === 'pending') {
       await this.uploads.update(
         { id: uploadId },
         { status: 'pending', rejection_reason: null },
@@ -1449,17 +1726,26 @@ export class DocumentsService {
   async setFileHidden(fileId: string, userId: string, hidden: boolean) {
     const file = await this.documents.findOne({
       where: { id: fileId },
-      select: { id: true, upload_id: true },
+      select: { id: true, upload_id: true, status: true },
     });
     if (!file) throw new NotFoundException('File not found');
 
     const upload = await this.uploads.findOne({
       where: { id: file.upload_id },
-      select: { id: true, uploader_id: true, hidden_at: true },
+      select: { id: true, uploader_id: true, hidden_at: true, status: true },
     });
     if (!upload) throw new NotFoundException('Upload not found');
     if (upload.uploader_id !== userId)
       throw new ForbiddenException('Not your upload');
+
+    // Both have to be published — see setHidden. A file awaiting review inside
+    // an approved upload is as unpublished as one in a pending upload.
+    if (upload.status !== 'active' || file.status !== 'active')
+      throw new BadRequestException(
+        upload.status === 'pending' || file.status === 'pending'
+          ? 'This file is still under review, so there is nothing to hide yet.'
+          : 'Only a published file can be hidden.',
+      );
 
     await this.documents.update(
       { id: fileId },
@@ -1508,7 +1794,7 @@ export class DocumentsService {
       throw new NotFoundException('Upload not found');
 
     const viewer = await this.getViewer(userId);
-    if (!this.canView(upload, viewer))
+    if (!this.canView(upload, viewer, await this.viewerCohorts(viewer)))
       throw new NotFoundException('Upload not found');
 
     if (pinned) {
@@ -1536,12 +1822,31 @@ export class DocumentsService {
   async setHidden(uploadId: string, userId: string, hidden: boolean) {
     const upload = await this.uploads.findOne({
       where: { id: uploadId },
-      select: { id: true, uploader_id: true },
+      select: { id: true, uploader_id: true, status: true },
     });
 
     if (!upload) throw new NotFoundException('Upload not found');
     if (upload.uploader_id !== userId)
       throw new ForbiddenException('Not your upload');
+
+    /**
+     * Only a published document can be taken out of circulation — there is no
+     * circulation to take a pending or rejected one out of. Nobody but its
+     * uploader and the reviewers can see it either way, so hiding changes
+     * nothing a person could observe.
+     *
+     * It was worse than merely useless: hiding while under review left
+     * `hidden_at` set, so the upload came back from approval invisible, and
+     * the uploader had to notice their own approved document was missing and
+     * unhide it. The reviewers' queue never filtered on `hidden_at`, so from
+     * their side nothing looked wrong at all.
+     */
+    if (upload.status !== 'active')
+      throw new BadRequestException(
+        upload.status === 'pending'
+          ? 'This document is still under review, so there is nothing to hide yet.'
+          : 'Only a published document can be hidden.',
+      );
 
     await this.uploads.update(
       { id: uploadId },

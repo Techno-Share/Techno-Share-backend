@@ -18,6 +18,13 @@ const TOKEN_TTL_MS = 10 * 60 * 1000;
 
 /** What a /start payload may contain. Anything else is not one of ours. */
 const TOKEN_SHAPE = /^[A-Za-z0-9_-]{16,128}$/;
+/**
+ * Telegram's own rule for a public @username. Checked rather than trusted: an
+ * update is attacker-shaped input, and this value ends up offered as a contact.
+ */
+const USERNAME_SHAPE = /^[A-Za-z0-9_]{4,32}$/;
+/** Mirrors ArrayMaxSize in the users module's update-user.dto.ts. */
+const MAX_HANDLES = 5;
 
 /** Long-poll window. Telegram holds the request open until an update arrives. */
 const POLL_TIMEOUT_S = 25;
@@ -28,7 +35,7 @@ interface TelegramUpdate {
   message?: {
     text?: unknown;
     chat?: { id?: unknown };
-    from?: { id?: unknown };
+    from?: { id?: unknown; username?: unknown };
   };
 }
 
@@ -307,6 +314,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private async redeem(
     rawToken: string,
     chatId: string,
+    username: string | null,
   ): Promise<'linked' | 'already-elsewhere' | 'invalid'> {
     if (!TOKEN_SHAPE.test(rawToken)) return 'invalid';
 
@@ -331,10 +339,37 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (!userId) return 'invalid';
 
     try {
-      await this.users.update(
-        { id: userId },
-        { telegram_chat_id: chatId, telegram_linked_at: new Date() },
-      );
+      /**
+       * One statement, because the handle has to be merged against the list as
+       * it is now — reading it first and writing it back would lose whatever a
+       * second /start, or the profile, wrote in between.
+       *
+       * The username joins the saved accounts rather than replacing the chosen
+       * one: connecting the bot is not a statement about which Telegram the
+       * donor wants handed out, and overwriting a deliberate choice would be.
+       * It only becomes the choice when there is no choice yet.
+       *
+       * Capped at the same five the profile enforces, so the bot cannot grow
+       * the list past what the editor can show.
+       */
+      await this.users
+        .createQueryBuilder()
+        .update(User)
+        .set({
+          telegram_chat_id: chatId,
+          telegram_linked_at: () => 'now()',
+          telegram_handles: () => `
+            case
+              when :handle::text is null then telegram_handles
+              when :handle = any(telegram_handles) then telegram_handles
+              when cardinality(telegram_handles) >= ${MAX_HANDLES} then telegram_handles
+              else array_append(telegram_handles, :handle)
+            end`,
+          telegram: () => 'coalesce(telegram, :handle)',
+        })
+        .where('id = :userId', { userId })
+        .setParameter('handle', username ? `@${username}` : null)
+        .execute();
       return 'linked';
     } catch (err) {
       // 23505: the unique index caught this chat already belonging to another
@@ -424,6 +459,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (!message) return;
 
     const rawChatId = message.chat?.id;
+    const rawUsername = message.from?.username;
     const text = message.text;
     if (typeof rawChatId !== 'number' && typeof rawChatId !== 'string') return;
     if (typeof text !== 'string') return;
@@ -443,7 +479,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const result = await this.redeem(payload, chatId);
+    // Absent when the Telegram account has no public @username — there is
+    // simply nothing to offer then, and linking still succeeds.
+    const username =
+      typeof rawUsername === 'string' && USERNAME_SHAPE.test(rawUsername)
+        ? rawUsername
+        : null;
+    const result = await this.redeem(payload, chatId, username);
     if (result === 'linked') {
       await this.sendMessage(
         chatId,

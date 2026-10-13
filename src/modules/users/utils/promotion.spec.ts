@@ -9,6 +9,32 @@ import {
  * so they are tested directly rather than through a request.
  */
 describe('promotion', () => {
+  /**
+   * The regression this guards: an account seen BEFORE the moment arrived
+   * used to be stamped with the upcoming rollover, which made it equal to
+   * the schedule and therefore never due. Two real students were skipped.
+   */
+  it('is still due for an account that was seen before the moment arrived', () => {
+    const scheduled = new Date('2026-10-04T08:00:00Z');
+    const after = new Date('2026-10-04T08:04:00Z');
+    // Visited at 07:55 and nothing was recorded — the stamp stays null.
+    expect(isRolloverDue(scheduled, null, after)).toBe(true);
+  });
+
+  it('does not apply a rollover that fired before the account existed', () => {
+    const scheduled = new Date('2026-10-04T08:00:00Z');
+    const after = new Date('2026-10-04T09:00:00Z');
+    const createdLater = new Date('2026-10-04T08:30:00Z');
+    expect(isRolloverDue(scheduled, null, after, createdLater)).toBe(false);
+  });
+
+  it('does apply a rollover that fired after the account existed', () => {
+    const scheduled = new Date('2026-10-04T08:00:00Z');
+    const after = new Date('2026-10-04T09:00:00Z');
+    const createdEarlier = new Date('2026-09-01T00:00:00Z');
+    expect(isRolloverDue(scheduled, null, after, createdEarlier)).toBe(true);
+  });
+
   describe('isRolloverDue', () => {
     const scheduled = new Date('2026-09-16T07:31:00Z');
     const before = new Date('2026-09-16T07:30:00Z');

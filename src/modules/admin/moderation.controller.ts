@@ -11,6 +11,7 @@ import {
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ReviewerGuard, type ReviewerRequest } from './guards/reviewer.guard';
 import { AdminService } from './admin.service';
+import { RejectDto } from './dto/reject.dto';
 
 /**
  * The review queue: everything a department moderator does.
@@ -47,30 +48,9 @@ export class ModerationController {
     return this.adminService.getReviewerScope(req.reviewer!);
   }
 
-  /** GET /admin/pending/subjects */
-  @Get('pending/subjects')
-  getPendingSubjects(@Request() req: ReviewerRequest) {
-    return this.adminService.getPendingSubjects(req.reviewer!);
-  }
-
-  /** PATCH /admin/subjects/:id/approve */
-  @Patch('subjects/:id/approve')
-  approveSubject(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Request() req: ReviewerRequest,
-  ) {
-    return this.adminService.approveSubject(id, req.reviewer!);
-  }
-
-  /** PATCH /admin/subjects/:id/reject */
-  @Patch('subjects/:id/reject')
-  rejectSubject(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Request() req: ReviewerRequest,
-    @Body('reason') reason?: string,
-  ) {
-    return this.adminService.rejectSubject(id, req.reviewer!, reason);
-  }
+  // Subjects have no review queue: only a moderator of a department (or an
+  // admin) may add one, and what they add is published immediately. There is
+  // nobody left for a pending subject to be waiting on.
 
   /** GET /admin/pending/documents */
   @Get('pending/documents')
@@ -108,12 +88,12 @@ export class ModerationController {
   rejectDocumentGroup(
     @Param('groupId', ParseUUIDPipe) groupId: string,
     @Request() req: ReviewerRequest,
-    @Body('reason') reason?: string,
+    @Body() dto: RejectDto,
   ) {
     return this.adminService.rejectDocumentGroup(
       groupId,
       req.reviewer!,
-      reason,
+      dto.reason,
     );
   }
 
@@ -135,8 +115,8 @@ export class ModerationController {
   rejectFile(
     @Param('fileId', ParseUUIDPipe) fileId: string,
     @Request() req: ReviewerRequest,
-    @Body('reason') reason?: string,
+    @Body() dto: RejectDto,
   ) {
-    return this.adminService.rejectFile(fileId, req.reviewer!, reason);
+    return this.adminService.rejectFile(fileId, req.reviewer!, dto.reason);
   }
 }

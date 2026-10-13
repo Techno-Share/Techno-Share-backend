@@ -100,6 +100,16 @@ export class Upload {
   @Column({ type: 'timestamptz', nullable: true })
   rejected_at: Date | null;
 
+  /**
+   * When this rejected upload's files were actually deleted from storage.
+   *
+   * Null on a rejected upload means the bytes are still there, inside the
+   * retention window — see common/retention.ts. The sweep claims rows by
+   * setting this, so two backend replicas cannot purge the same upload twice.
+   */
+  @Column({ type: 'timestamptz', nullable: true })
+  files_purged_at: Date | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   uploaded_at: Date;
 

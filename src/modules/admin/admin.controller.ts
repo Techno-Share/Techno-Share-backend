@@ -11,6 +11,8 @@ import {
   Query,
   Request,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AdminGuard } from './guards/admin.guard';
@@ -22,12 +24,19 @@ import { PromotionSettingsService } from '../settings/promotion-settings.service
 import { SetPromotionDto } from './dto/set-promotion.dto';
 import { ModerationService } from './moderation.service';
 import { EditSubjectDto } from './dto/edit-subject.dto';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { IMAGE_UPLOAD_OPTIONS } from '../../common/upload/image-upload.options';
 import {
   BanUserDto,
   SetUserPlacementDto,
   SetUserRoleDto,
 } from './dto/user-admin.dto';
 import { SetBookHiddenDto } from './dto/book-admin.dto';
+import {
+  ListDocumentsDto,
+  ListSubjectsDto,
+  ListUsersDto,
+} from './dto/list-admin.dto';
 import { RateLimitTier } from '../../common/rate-limit/rate-limit.decorator';
 
 // Admin-only, without exception — the class guard is the whole boundary.
@@ -77,37 +86,40 @@ export class AdminController {
     return this.adminService.getStats();
   }
 
-  /** GET /admin/recent-documents */
-  @Get('recent-documents')
-  getRecentDocuments() {
-    return this.adminService.getRecentDocuments(10);
-  }
-
-  /** GET /admin/users?search= */
+  /**
+   * GET /admin/users?page=&limit=&search=&status=&sortBy=&order=
+   *
+   * Paginated: the handler answers `{ items, total, page, limit }`, the shape
+   * the student feed already uses, so the client reads every list the same way.
+   */
   @RateLimitTier('search')
   @Get('users')
-  getAllUsers(@Query('search') search?: string) {
-    return this.adminService.getAllUsers(search);
+  getAllUsers(@Query() query: ListUsersDto) {
+    return this.adminService.getAllUsers(query);
   }
 
-  /** GET /admin/subjects?search=&major_id=&status= */
+  /** GET /admin/subjects?page=&limit=&search=&major_id=&sortBy=&order= */
   @RateLimitTier('search')
   @Get('subjects')
-  getAllSubjects(
-    @Query('search') search?: string,
-    @Query('major_id') majorId?: string,
-    @Query('status') status?: string,
-  ) {
-    return this.adminService.getAllSubjects(search, majorId, status);
+  getAllSubjects(@Query() query: ListSubjectsDto) {
+    return this.adminService.getAllSubjects(query);
   }
 
-  /** PATCH /admin/subjects/:id — edit name / acronym / semester */
+  /**
+   * PATCH /admin/subjects/:id — edit name / acronym / semester / cover.
+   *
+   * Accepts JSON, or multipart/form-data with an `image` file. Same contract
+   * as POST /subjects and PATCH /majors/:id: a sent file wins over any
+   * `subject_url` in the body, and an empty `subject_url` clears the cover.
+   */
   @Patch('subjects/:id')
+  @UseInterceptors(FileInterceptor('image', IMAGE_UPLOAD_OPTIONS))
   editSubject(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: EditSubjectDto,
+    @UploadedFile() image?: Express.Multer.File,
   ) {
-    return this.adminService.editSubject(id, dto);
+    return this.adminService.editSubject(id, dto, image);
   }
 
   /** DELETE /admin/subjects/:id */
@@ -236,23 +248,20 @@ export class AdminController {
     return this.moderation.majorsWithoutModerator();
   }
 
-  /** GET /admin/documents?search=&doc_type=&major_id=&uploader_id=&since= */
+  /**
+   * GET /admin/documents
+   *   ?page=&limit=&search=&doc_type=&major_id=&uploader_id=&status=&since=
+   *   &sortBy=&order=
+   *
+   * `status` is one of the four the tab displays — active, rejected, hidden,
+   * expired — not the two in the column. Hidden and expired are sub-states of
+   * an active upload, and the service turns them into predicates so that the
+   * browser no longer has to fetch every row to narrow them.
+   */
   @RateLimitTier('search')
   @Get('documents')
-  getAllDocuments(
-    @Query('search') search?: string,
-    @Query('doc_type') docType?: string,
-    @Query('major_id') majorId?: string,
-    @Query('uploader_id') uploaderId?: string,
-    @Query('since') since?: string,
-  ) {
-    return this.adminService.getAllDocuments({
-      search,
-      docType,
-      majorId,
-      uploaderId,
-      since,
-    });
+  getAllDocuments(@Query() query: ListDocumentsDto) {
+    return this.adminService.getAllDocuments(query);
   }
 
   /** DELETE /admin/documents/:id */

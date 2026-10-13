@@ -1,5 +1,6 @@
 import {
   Column,
+  CreateDateColumn,
   Entity,
   JoinColumn,
   ManyToOne,
@@ -75,4 +76,13 @@ export class DocumentFile {
    */
   @Column({ type: 'timestamptz', nullable: true })
   hidden_at: Date | null;
+
+  /**
+   * When this file was attached — its own, not its upload's.
+   *
+   * A file added to an existing upload is newer than the folder it joined, and
+   * the list used to show the upload's date against every row.
+   */
+  @CreateDateColumn({ type: 'timestamptz' })
+  created_at: Date;
 }
