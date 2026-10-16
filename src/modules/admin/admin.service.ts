@@ -323,6 +323,9 @@ export class AdminService {
         role: u.role,
         year_level: u.year_level,
         created_at: u.created_at,
+        // The table draws a photo where it has one and initials where it does
+        // not; without this it could only ever draw initials.
+        avatar_url: u.avatar_url,
         majors: u.major ? { id: u.major.id, acronym: u.major.acronym } : null,
         // Everything the admin UI needs to show state and offer the right
         // action. Shape unchanged from when these were columns on `users`, so
