@@ -21,6 +21,7 @@ import { AdminModule } from './modules/admin/admin.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { TelegramModule } from './modules/telegram/telegram.module';
 import { RateLimitModule } from './common/rate-limit/rate-limit.module';
+import { HealthModule } from './modules/health/health.module';
 import { BooksModule } from './modules/books/books.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { MulterExceptionFilter } from './common/filters/multer-exception.filter';
@@ -57,6 +58,8 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
     // Registers the APP_GUARD that counts every request. See its module doc.
     RateLimitModule,
     BooksModule,
+    // Liveness/readiness probes for Docker and monitoring.
+    HealthModule,
   ],
   controllers: [AppController],
   providers: [
