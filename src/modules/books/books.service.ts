@@ -449,8 +449,7 @@ export class BooksService {
       where: { id: userId },
       select: { telegram: true },
     });
-    // Accepting is a promise to meet; without a handle the receiver has no way
-    // to reach them and the flow dead-ends after this step.
+
     if (!donor?.telegram)
       throw new BadRequestException(
         'Add your Telegram to your profile before accepting a request',
@@ -462,8 +461,6 @@ export class BooksService {
       const books = manager.getRepository(Book);
       const requests = manager.getRepository(BookRequest);
 
-      // Locked for the length of the transaction: two donors clicking accept on
-      // rival requests would otherwise both read 'available' and both win.
       const book = await books
         .createQueryBuilder('b')
         .setLock('pessimistic_write')
@@ -498,9 +495,6 @@ export class BooksService {
       );
       await books.update({ id: bookId }, { status: 'reserved' });
 
-      // Everyone else who asked: the book is spoken for, so their request can
-      // never be actioned. Declining now is honest, and the partial unique
-      // index would reject a second active row anyway.
       const rivals = await requests.find({
         where: { book_id: bookId, status: 'pending' },
         select: { id: true, requester_id: true },
@@ -563,9 +557,13 @@ export class BooksService {
   /**
    * Call off a reservation, from either side.
    *
-   * A book must not sit reserved forever because the receiver went quiet, and
-   * the donor may equally have changed their mind. Both routes end the same
-   * way: the request is cancelled and the book goes back on the shelf.
+   * The only way a reservation ends without a handover. Either side may call
+   * it: the receiver went quiet, or the donor changed their mind. Both routes
+   * end the same way — the request is cancelled and the book goes back on the
+   * shelf.
+   *
+   * Nothing releases a reservation on a timer, so a book stays reserved until
+   * one of the two people involved says otherwise.
    *
    * Distinct from decline, which is the donor turning down a request they have
    * not yet accepted.
@@ -628,66 +626,6 @@ export class BooksService {
         .catch(() => {});
 
     return { message: 'Reservation cancelled', status: 'available' };
-  }
-
-  // ─── Reservation expiry ────────────────────────────────────────────────────
-
-  /** How long a receiver has to collect before the book is released. */
-  private static readonly RESERVATION_DAYS = 3;
-
-  /**
-   * Release books reserved longer than the window.
-   *
-   * Driven by a scheduled job rather than checked on read: a book nobody looks
-   * at must still come back, and a receiver who never returns would otherwise
-   * hold it forever. Runs hourly — the window is days, so the exact minute does
-   * not matter.
-   */
-  async expireStaleReservations(now = new Date()) {
-    const cutoff = new Date(
-      now.getTime() - BooksService.RESERVATION_DAYS * 24 * 60 * 60 * 1000,
-    );
-
-    const stale = await this.requests
-      .createQueryBuilder('r')
-      .innerJoinAndSelect('r.book', 'b')
-      .where('r.status = :status', { status: 'accepted' })
-      .andWhere('r.accepted_at is not null')
-      .andWhere('r.accepted_at < :cutoff', { cutoff })
-      .getMany();
-
-    for (const req of stale) {
-      await this.dataSource.transaction(async (manager) => {
-        await manager
-          .getRepository(BookRequest)
-          .update(
-            { id: req.id },
-            { status: 'expired', expired_at: now, resolved_at: now },
-          );
-        await manager
-          .getRepository(Book)
-          .update({ id: req.book_id }, { status: 'available' });
-      });
-
-      const title = req.book?.title ?? 'A book';
-      // Both sides were waiting on this, so both are told.
-      for (const userId of [req.requester_id, req.book?.donor_id]) {
-        if (!userId) continue;
-        this.notifications
-          .create({
-            user_id: userId,
-            type: 'book_reservation_expired',
-            message: `The reservation for "${title}" has expired. The book is available again.`,
-            key: 'bookReservationExpired',
-            params: { title },
-            ref_id: req.book_id,
-            ref_type: 'book',
-          })
-          .catch(() => {});
-      }
-    }
-
-    return { expired: stale.length };
   }
 
   // ─── Receiver confirms the handover ────────────────────────────────────────

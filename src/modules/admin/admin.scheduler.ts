@@ -6,7 +6,7 @@ import { REJECTED_FILE_RETENTION_DAYS } from '../../common/retention';
 /**
  * Deletes the files of uploads rejected longer ago than the retention window.
  *
- * A separate class from AdminService for the same reason BooksScheduler is one:
+ * A separate class from AdminService, so the schedule lives next to nothing else:
  * the service holds the rule, this decides when it runs. Backend-driven because
  * nobody is watching a rejected upload — it is precisely the thing no page has
  * open, so a frontend timer would never fire for it.
