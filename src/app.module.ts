@@ -35,7 +35,7 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
       load: [configuration],
       validate: validateEnv,
     }),
-    // Drives the book-reservation expiry sweep; see BooksScheduler.
+    // Drives the retention sweep; see AdminScheduler.
     ScheduleModule.forRoot(),
     DatabaseModule,
     // Before anything that counts: the rate limiter and the upload quota both
