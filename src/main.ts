@@ -5,6 +5,7 @@ import { ValidationPipe } from '@nestjs/common';
 import cookieParser from 'cookie-parser';
 import { securityHeaders } from './common/security/helmet.config';
 import { RedactingLogger } from './common/logging/redacting.logger';
+import { setupSwagger } from './common/swagger/swagger.config';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
@@ -59,6 +60,17 @@ async function bootstrap() {
       transform: true,
     }),
   );
+  /**
+   * After the global ValidationPipe, so the documented schemas come from the
+   * same DTO classes the pipe enforces.
+   *
+   * Served in every environment on purpose: this API is reachable only through
+   * the tunnel and the load balancer, the document exposes no secrets, and a
+   * reference that is absent in production is one nobody trusts. Set
+   * SWAGGER_ENABLED=false to withhold it.
+   */
+  if (process.env.SWAGGER_ENABLED !== 'false') setupSwagger(app);
+
   await app.listen(process.env.PORT ?? 3000);
 }
 void bootstrap();

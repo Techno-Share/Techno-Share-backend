@@ -119,6 +119,17 @@ export class User {
    * `user_bans` on `lifted_at is null` as the JWT strategy does.
    */
 
+  /**
+   * The last time this account made an authenticated request.
+   *
+   * Written by JwtStrategy at most once a minute, so it trails real activity by
+   * up to that long — the admin table's "online" threshold is set well above it
+   * for that reason. Null means the account has not been seen since the column
+   * was added, which is not the same as never having signed in.
+   */
+  @Column({ type: 'timestamptz', nullable: true })
+  last_seen_at: Date | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;
 }

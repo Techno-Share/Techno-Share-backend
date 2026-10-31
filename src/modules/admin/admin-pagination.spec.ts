@@ -459,4 +459,132 @@ describe('admin list query validation', () => {
     expect(await check(ListDocumentsDto, {})).toHaveLength(0);
     expect(await check(ListSubjectsDto, {})).toHaveLength(0);
   });
+
+  /**
+   * The promotions table is not a list of rows from one table at all.
+   *
+   * It groups promotion_events by the rollover an admin scheduled, and adds
+   * the currently scheduled one even when it has promoted nobody yet — so it
+   * is raw SQL with a CTE rather than a query builder, and none of the
+   * assertions above reach it. The SQL itself was checked against Postgres;
+   * what is pinned here is the window it asks for and the shape it returns.
+   */
+  describe('the promotions table', () => {
+    function makeRolloverService(
+      rows: {
+        rollover_at: Date;
+        promoted_users: string;
+        eligible_users: string;
+      }[],
+      total = rows.length,
+      scheduled: Date | null = null,
+    ) {
+      const calls: { sql: string; params: unknown[] }[] = [];
+      const service = Object.create(AdminService.prototype) as unknown as {
+        promotionEvents: unknown;
+        promotionSettings: unknown;
+        getAllPromotions(q?: Record<string, unknown>): Promise<{
+          items: {
+            rollover_at: Date;
+            promoted_users: number;
+            eligible_users: number;
+          }[];
+          total: number;
+          page: number;
+          limit: number;
+        }>;
+      };
+      service.promotionEvents = {
+        query: (sql: string, params: unknown[]) => {
+          calls.push({ sql, params });
+          return Promise.resolve(
+            sql.includes('count(*) as n') ? [{ n: String(total) }] : rows,
+          );
+        },
+      };
+      service.promotionSettings = {
+        rolloverAt: () => Promise.resolve(scheduled),
+      };
+      return { service, calls };
+    }
+
+    const AT = new Date('2026-07-01T00:00:00Z');
+    const row = (promoted: string, eligible: string, at = AT) => ({
+      rollover_at: at,
+      promoted_users: promoted,
+      eligible_users: eligible,
+    });
+
+    it('bounds the window to the requested page', async () => {
+      const { service, calls } = makeRolloverService([row('1', '5')], 9);
+
+      const result = await service.getAllPromotions({ page: 3, limit: 20 });
+
+      const page = calls.find((c) => c.sql.includes('offset'))!;
+      expect(page.params.slice(1)).toEqual([40, 20]); // (3 - 1) * 20, then the size
+      expect(result).toMatchObject({ total: 9, page: 3, limit: 20 });
+    });
+
+    /** Newest first — the schedule most likely still rolling out. */
+    it('orders by the scheduled instant, newest first', async () => {
+      const { service, calls } = makeRolloverService([], 0);
+
+      await service.getAllPromotions({});
+
+      const page = calls.find((c) => c.sql.includes('offset'))!;
+      expect(page.sql).toContain('order by r.rollover_at desc');
+    });
+
+    /**
+     * Counts come back from Postgres as strings — `count()` is bigint, and
+     * node-postgres will not narrow it to a JS number on its own. Left as they
+     * arrive, "9" and "10" would sort and compare as text in the client.
+     */
+    it('returns the counts as numbers, not bigint strings', async () => {
+      const { service } = makeRolloverService([row('3', '12')]);
+
+      const { items } = await service.getAllPromotions({});
+
+      expect(items[0].promoted_users).toBe(3);
+      expect(items[0].eligible_users).toBe(12);
+      expect(items[0].rollover_at).toBe(AT);
+    });
+
+    /**
+     * The scheduled rollover is passed into the CTE so it can be listed even
+     * before anybody has collected it — otherwise an admin who has just set a
+     * date sees an empty table at exactly the moment they want to watch it.
+     */
+    it('passes the scheduled rollover to the query', async () => {
+      const scheduled = new Date('2026-10-29T14:27:00Z');
+      const { service, calls } = makeRolloverService([], 0, scheduled);
+
+      await service.getAllPromotions({});
+
+      expect(calls).toHaveLength(2); // the page and its count
+      for (const call of calls) {
+        expect(call.params[0]).toBe(scheduled);
+        expect(call.sql).toContain('union');
+      }
+    });
+
+    /** No schedule set is not an error — the union branch simply adds nothing. */
+    it('copes with no rollover scheduled', async () => {
+      const { service, calls } = makeRolloverService([], 0, null);
+
+      const result = await service.getAllPromotions({});
+
+      expect(result.items).toEqual([]);
+      expect(calls[0].params[0]).toBeNull();
+    });
+
+    /** An empty result still reports a usable page, not NaN. */
+    it('reports zero rather than NaN when nothing has been scheduled', async () => {
+      const { service } = makeRolloverService([], 0);
+
+      const result = await service.getAllPromotions({ page: 1, limit: 10 });
+
+      expect(result.total).toBe(0);
+    });
+  });
 });

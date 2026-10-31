@@ -16,6 +16,7 @@ import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { Book } from '../books/entities/book.entity';
 import { BookRequest } from '../books/entities/book-request.entity';
 import { Notification } from '../notifications/entities/notification.entity';
+import { PromotionEvent } from '../users/entities/promotion-event.entity';
 import { Major } from '../majors/entities/major.entity';
 import { yearLevelsForMajor } from '../documents/utils/year-levels';
 import { BUCKETS, StorageService } from '../storage/storage.service';
@@ -26,6 +27,7 @@ import { PromotionSettingsService } from '../settings/promotion-settings.service
 import type { Paginated } from '../../common/dto/pagination.dto';
 import type {
   ListDocumentsDto,
+  ListPromotionsDto,
   ListSubjectsDto,
   ListUsersDto,
   SortOrder,
@@ -98,6 +100,8 @@ export class AdminService {
     private readonly bookRequests: Repository<BookRequest>,
     @InjectRepository(Notification)
     private readonly notificationsRepo: Repository<Notification>,
+    @InjectRepository(PromotionEvent)
+    private readonly promotionEvents: Repository<PromotionEvent>,
     private readonly storage: StorageService,
     private readonly notificationsService: NotificationsService,
     private readonly moderation: ModerationService,
@@ -323,6 +327,12 @@ export class AdminService {
         role: u.role,
         year_level: u.year_level,
         created_at: u.created_at,
+        /**
+         * When they last made an authenticated request — the users table's
+         * activity column. Null means not seen since the column was added,
+         * which the client must not render as "never signed in".
+         */
+        last_seen_at: u.last_seen_at,
         // The table draws a photo where it has one and initials where it does
         // not; without this it could only ever draw initials.
         avatar_url: u.avatar_url,
@@ -889,6 +899,102 @@ export class AdminService {
       lifted_by: name(b.liftedBy),
       active: b.lifted_at === null,
     }));
+  }
+
+  // ─── Promotions ────────────────────────────────────────────────────────────
+
+  /**
+   * The promotions an admin has scheduled, newest first.
+   *
+   * One row per ROLLOVER, not per student. The question this answers is "what
+   * did I schedule, and how far has it reached?" — so a rollover that moved
+   * forty students is one row saying forty, not forty rows.
+   *
+   * Dated by `rollover_at`, which is the instant the ADMIN set. The moment a
+   * particular student collected it is deliberately not shown: promotions are
+   * applied on each student's next visit, so those timestamps are scattered
+   * across whenever people happened to sign in and say nothing about the
+   * promotion itself.
+   *
+   * `eligible_users` counts accounts that already existed when the rollover
+   * fired, because those are the only ones it could ever promote — isRolloverDue
+   * refuses a rollover that predates the account. Counting every account instead
+   * would make an old rollover look like it had missed students who had not yet
+   * registered.
+   *
+   * The gap between the two numbers is the rollout still in progress, and it is
+   * the reason this table exists: between scheduling a rollover and the last
+   * student signing in, promoted_users trails eligible_users.
+   */
+  async getAllPromotions(
+    query: ListPromotionsDto = {},
+  ): Promise<Paginated<unknown>> {
+    const { limit, page, skip } = pageWindow(query);
+    const scheduled = await this.promotionSettings.rolloverAt();
+
+    /**
+     * Every rollover worth listing.
+     *
+     * UNION, not UNION ALL — it dedupes, so the scheduled rollover appears once
+     * whether or not it has promoted anybody yet. That second branch is what
+     * puts a freshly scheduled rollover in the table reading "0 of 40": without
+     * it, a rollover nobody has collected yet produces no rows at all, and the
+     * screen would be empty at exactly the moment an admin wants to watch it.
+     */
+    const ROLLOVERS = `
+      with rollovers as (
+        select distinct rollover_at from promotion_events
+        union
+        select $1::timestamptz
+         where $1::timestamptz is not null and $1::timestamptz <= now()
+      )`;
+
+    type Raw = {
+      rollover_at: Date;
+      promoted_users: string;
+      eligible_users: string;
+    };
+
+    let rows: Raw[];
+    let totalRow: { n: string }[];
+    try {
+      [rows, totalRow] = await Promise.all([
+        this.promotionEvents.query<Raw[]>(
+          `${ROLLOVERS}
+           select r.rollover_at as rollover_at,
+                  (select count(distinct pe.user_id)
+                     from promotion_events pe
+                    where pe.rollover_at = r.rollover_at) as promoted_users,
+                  (select count(*)
+                     from users u
+                    where u.created_at < r.rollover_at)   as eligible_users
+             from rollovers r
+            order by r.rollover_at desc
+            offset $2 limit $3`,
+          [scheduled, skip, limit],
+        ),
+        this.promotionEvents.query<{ n: string }[]>(
+          `${ROLLOVERS} select count(*) as n from rollovers`,
+          [scheduled],
+        ),
+      ]);
+    } catch {
+      throw new InternalServerErrorException('Failed to fetch promotions');
+    }
+
+    return {
+      items: rows.map((r) => ({
+        /** The instant the admin set — what the table is dated by. */
+        rollover_at: r.rollover_at,
+        /** Distinct students who have collected this rollover so far. */
+        promoted_users: Number(r.promoted_users),
+        /** Accounts that existed when it fired, so could be promoted by it. */
+        eligible_users: Number(r.eligible_users),
+      })),
+      total: Number(totalRow[0]?.n ?? 0),
+      page,
+      limit,
+    };
   }
 
   // ─── Subjects ──────────────────────────────────────────────────────────────

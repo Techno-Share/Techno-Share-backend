@@ -6,6 +6,11 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import {
+  PERSON_NAME_MESSAGE,
+  PERSON_NAME_PATTERN,
+} from '../../../common/dto/text-patterns';
+import { ApiProperty } from '@nestjs/swagger';
 
 /**
  * One capital or Khmer character, then letters, and nothing else.
@@ -19,11 +24,6 @@ import {
  * rest on purpose: Khmer has no letter case, so requiring a capital would make
  * it impossible to register under a Khmer name.
  */
-const NAME_PATTERN = /^[A-Zក-៿][A-Za-zក-៿]*$/;
-
-const NAME_MESSAGE =
-  'Name must start with a capital letter and contain no spaces, ' +
-  'digits or symbols';
 
 /**
  * Everything needed to create an account, in one request.
@@ -36,21 +36,44 @@ const NAME_MESSAGE =
  * audience-restricted uploads stay hidden, since canView matches on that pair.
  */
 export class RegisterDto {
+  @ApiProperty({
+    description:
+      'Given name. One capital (or any Khmer character) then letters only — no spaces, digits or punctuation.',
+    example: 'Sophea',
+    maxLength: 50,
+  })
   @IsString()
   @IsNotEmpty({ message: 'First name is required' })
   @MaxLength(50)
-  @Matches(NAME_PATTERN, { message: NAME_MESSAGE })
+  @Matches(PERSON_NAME_PATTERN, { message: PERSON_NAME_MESSAGE })
   first_name: string;
 
+  @ApiProperty({
+    description: 'Family name. Same rule as the given name.',
+    example: 'Chan',
+    maxLength: 50,
+  })
   @IsString()
   @IsNotEmpty({ message: 'Last name is required' })
   @MaxLength(50)
-  @Matches(NAME_PATTERN, { message: NAME_MESSAGE })
+  @Matches(PERSON_NAME_PATTERN, { message: PERSON_NAME_MESSAGE })
   last_name: string;
 
+  @ApiProperty({
+    description:
+      'Must be unused. A six-digit code is sent here and the account cannot sign in until it is confirmed.',
+    example: 'sophea.chan@itc.edu.kh',
+    format: 'email',
+  })
   @IsEmail({}, { message: 'Enter a valid email address' })
   email: string;
 
+  @ApiProperty({
+    description: 'At least 8 characters.',
+    example: 'correct-horse-battery',
+    minLength: 8,
+    format: 'password',
+  })
   @IsString()
   @MinLength(8, { message: 'Password must be at least 8 characters' })
   password: string;

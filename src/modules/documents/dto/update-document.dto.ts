@@ -15,38 +15,64 @@ import {
 } from 'class-validator';
 import { DocType, parseAudienceEntries } from './create-document.dto';
 import { AudienceEntryDto } from './audience-entry.dto';
-
-// Letters (any language, incl. Khmer marks), numbers, spaces and hyphens.
-const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s_-]+$/u;
+import {
+  TITLE_MESSAGE,
+  TITLE_PATTERN,
+} from '../../../common/dto/text-patterns';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 
 // Metadata-only edit of an existing upload (files are not changed here).
 export class UpdateDocumentDto {
+  @ApiPropertyOptional({
+    description: 'New title.',
+    maxLength: 100,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(100)
-  @Matches(TITLE_PATTERN, {
-    message: 'Title must not contain special characters',
-  })
+  @Matches(TITLE_PATTERN, { message: TITLE_MESSAGE })
   title?: string;
 
+  @ApiPropertyOptional({
+    description: 'New type. Must belong to the list its major offers.',
+    enum: DocType,
+  })
   @IsOptional()
   @IsEnum(DocType)
   doc_type?: DocType;
 
+  @ApiPropertyOptional({
+    description: 'Move to another department.',
+    format: 'uuid',
+  })
   @IsOptional()
   @IsUUID()
   major_id?: string;
 
+  @ApiPropertyOptional({
+    description: 'Move to another subject. Send null to detach.',
+    format: 'uuid',
+    nullable: true,
+  })
   @IsOptional()
   @IsUUID()
   subject_id?: string | null;
 
   // null clears the description; a string sets it.
+  @ApiPropertyOptional({
+    description: 'New description.',
+    maxLength: 500,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(500)
   description?: string | null;
 
+  @ApiPropertyOptional({
+    description: 'New year.',
+    minimum: 1,
+    maximum: 5,
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -54,6 +80,10 @@ export class UpdateDocumentDto {
   @Max(5)
   year_level?: number;
 
+  @ApiPropertyOptional({
+    description: 'New academic year.',
+    example: '2024-2025',
+  })
   @IsOptional()
   @IsString()
   @MaxLength(10)
@@ -62,6 +92,10 @@ export class UpdateDocumentDto {
   // Who may see this, as (department, year) pairs. Omit it to leave the audience
   // as it is; sending it replaces the lot. Whether it may be empty depends on
   // the major, so that check lives in DocumentsService.resolveAudience.
+  @ApiPropertyOptional({
+    description: 'Replaces the audience entirely; it is not merged.',
+    type: [AudienceEntryDto],
+  })
   @IsOptional()
   @Transform(parseAudienceEntries)
   @IsArray()
@@ -75,6 +109,10 @@ export class UpdateDocumentDto {
   // prefills its own past date, and editing the title of one shouldn't force
   // the owner to also extend it. DocumentsService.update rejects a past date
   // only when it's actually being CHANGED.
+  @ApiPropertyOptional({
+    description: 'New soft expiry. Send null to clear it.',
+    nullable: true,
+  })
   @IsOptional()
   @IsISO8601()
   expires_at?: string | null;

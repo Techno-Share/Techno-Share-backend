@@ -3,44 +3,42 @@ import type { Response } from 'express';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { RedisService } from '../../common/redis/redis.service';
-import { ClamAvService } from '../../common/security/clamav.service';
+import {
+  ApiOkResponse,
+  ApiOperation,
+  ApiServiceUnavailableResponse,
+  ApiTags,
+} from '@nestjs/swagger';
+import { API_TAGS } from '../../common/swagger/swagger.config';
 
 type Dep = 'up' | 'down' | 'not-configured';
 
 /**
  * Probes for the orchestrator and for monitoring.
  *
- * Two endpoints, kept deliberately different:
+ *  - `/health/live` — is this process alive? Touches nothing. Docker restarts
+ *    on it, so it must not fail for a reason a restart cannot fix; a
+ *    dependency outage would otherwise restart-loop every replica.
+ *  - `/health/ready` — should this replica take traffic? Checks Postgres only.
  *
- *  - /health/live  answers "is this process alive?" and touches nothing. It is
- *    what Docker restarts on, so it must not fail for a reason a restart
- *    cannot fix — a dependency outage would otherwise put every replica into
- *    a restart loop while the application itself was fine.
+ * Readiness is narrow on purpose, because it feeds the load balancer: any
+ * dependency it checks becomes one that can take the whole site down. Redis
+ * serves rate limits and socket rooms, MinIO serves already-uploaded files,
+ * and a blip in either would leave nginx with no upstream at all. Postgres is
+ * the only dependency without which no request can be served.
  *
- *  - /health/ready answers "should this replica receive traffic?" and checks
- *    POSTGRES ONLY.
+ * Other dependencies appear in the body as information, never as a verdict —
+ * the body is for dashboards, the status code is for the balancer.
  *
- * The narrowness of the readiness check is the important decision. It is
- * tempting to verify every dependency here, but readiness feeds the load
- * balancer: anything listed becomes a thing that can take the whole site down.
- * ClamAV only matters for uploads, and MinIO only for files already uploaded —
- * if a scanner blip marked both replicas unready, nginx would have no upstream
- * at all and the site would go dark because nobody could scan a file nobody was
- * uploading. Postgres is the only dependency without which no request can be
- * served, so it is the only one that gates traffic.
- *
- * Everything else is reported in the body as information, never as a verdict.
- * That is what a dashboard reads; the status code is what the balancer reads.
- *
- * Unauthenticated on purpose: a prober has no session, and the body says
- * nothing a caller could not learn by watching the site work or not work.
+ * Unauthenticated: a prober has no session, and the body reveals nothing a
+ * caller could not learn by watching the site work or not work.
  */
+@ApiTags(API_TAGS.health)
 @Controller('health')
 export class HealthController {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     private readonly redis: RedisService,
-    private readonly clamav: ClamAvService,
   ) {}
 
   /**
@@ -50,6 +48,21 @@ export class HealthController {
    * `"status":"ok"` should get the same shape from both probes rather than one
    * wrapped in the API envelope and one not.
    */
+  @ApiOperation({
+    summary: 'Liveness probe',
+    description:
+      'Answers whether the process is running and touches no dependency. Docker restarts on this, so it must not fail for anything a restart cannot fix. Bypasses the success envelope - the body is exactly as shown.',
+  })
+  @ApiOkResponse({
+    description: 'The process is up.',
+    schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', example: 'ok' },
+        uptime_seconds: { type: 'number', example: 4213 },
+      },
+    },
+  })
   @Get('live')
   live(@Res() res: Response) {
     res.status(200).json({
@@ -72,14 +85,32 @@ export class HealthController {
    *    envelope. A prober wants a flat body it can match a keyword against,
    *    not an envelope it has to unwrap.
    */
+  @ApiOperation({
+    summary: 'Readiness probe',
+    description:
+      'Answers whether this replica should receive traffic. Checks Postgres only - readiness feeds the load balancer, so any dependency listed here becomes one that can take the whole site down. Redis and object storage appear in the body as information, never as a verdict. Bypasses the success envelope.',
+  })
+  @ApiOkResponse({
+    description: 'Postgres reachable; this replica can serve traffic.',
+    schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', example: 'ok' },
+        database: { type: 'string', enum: ['up', 'down', 'not-configured'] },
+        redis: { type: 'string', enum: ['up', 'down', 'not-configured'] },
+        storage: { type: 'string', enum: ['up', 'down', 'not-configured'] },
+      },
+    },
+  })
+  @ApiServiceUnavailableResponse({
+    description:
+      'Postgres unreachable. The balancer should stop sending traffic here.',
+  })
   @Get('ready')
   async ready(@Res() res: Response) {
     // checkRedis is synchronous — it reads a getter rather than issuing a
-    // command — so only the two that do I/O are awaited together.
-    const [db, clamav] = await Promise.all([
-      this.checkDb(),
-      this.checkClamav(),
-    ]);
+    // command — so only the database probe does I/O.
+    const db = await this.checkDb();
     const redis = this.checkRedis();
 
     const healthy = db === 'up';
@@ -89,7 +120,6 @@ export class HealthController {
       db,
       // Informational: visible to a dashboard, never acted on by the balancer.
       redis,
-      clamav,
     });
   }
 
@@ -115,14 +145,5 @@ export class HealthController {
   private checkRedis(): Dep {
     if (!this.redis.configured) return 'not-configured';
     return this.redis.client ? 'up' : 'down';
-  }
-
-  /** clamd answers PING with PONG once its signature database is loaded. */
-  private async checkClamav(): Promise<Dep> {
-    try {
-      return (await this.clamav.ping()) ? 'up' : 'down';
-    } catch {
-      return 'down';
-    }
   }
 }

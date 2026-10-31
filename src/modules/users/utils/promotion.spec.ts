@@ -91,6 +91,39 @@ describe('promotion', () => {
     });
   });
 
+  /**
+   * Which rollovers a student should actually be told about.
+   *
+   * `getMe` reports `promoted_to_year` only when the year MOVED, and these are
+   * the cases that decides between. A capped advance stamps the student as
+   * having received the rollover while leaving them where they were — telling
+   * them they were promoted would be untrue.
+   */
+  describe('a promotion worth announcing', () => {
+    const announced = (acronym: string, from: number) => {
+      const to = advanceYearLevel(acronym, from, 1);
+      return to > from ? to : null;
+    };
+
+    it.each([
+      ['TC', 1, 2],
+      ['GIC', 3, 4],
+      ['GIC', 4, 5],
+    ])('%s year %i -> %i is announced', (acronym, from, to) => {
+      expect(announced(acronym, from)).toBe(to);
+    });
+
+    it('says nothing to a final-year student', () => {
+      expect(announced('GIC', 5)).toBeNull();
+    });
+
+    it('says nothing at the top of Foundation', () => {
+      // Foundation year 2 is capped too. That student gets the department
+      // prompt instead, which applyPendingPromotion returns early for.
+      expect(announced('TC', 2)).toBeNull();
+    });
+  });
+
   describe('needsDepartmentChoice', () => {
     it('is true for a foundation student in their final year', () => {
       expect(needsDepartmentChoice('TC', 2)).toBe(true);

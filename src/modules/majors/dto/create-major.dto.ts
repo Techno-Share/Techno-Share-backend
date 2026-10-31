@@ -5,18 +5,22 @@ import {
   IsOptional,
   Matches,
 } from 'class-validator';
+import { ACADEMIC_NAME_PATTERN } from '../../../common/dto/text-patterns';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-// Letters (any language, incl. combining marks for Khmer), numbers, spaces and
-// hyphens — and at least one letter/number. Mirrors SUBJECT_NAME_PATTERN.
-export const MAJOR_NAME_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s-]+$/u;
 // Acronyms are uppercase letters/digits (GIC, AMS, GTR…).
 export const MAJOR_ACRONYM_PATTERN = /^[A-Z0-9]+$/;
 
 export class CreateMajorDto {
   @IsString()
   @MaxLength(100)
-  @Matches(MAJOR_NAME_PATTERN, {
+  @Matches(ACADEMIC_NAME_PATTERN, {
     message: 'Major name must not contain special characters',
+  })
+  @ApiProperty({
+    description: 'Full department name.',
+    example: 'Computer Science and Engineering',
+    maxLength: 100,
   })
   name!: string;
 
@@ -28,8 +32,18 @@ export class CreateMajorDto {
   @Matches(MAJOR_ACRONYM_PATTERN, {
     message: 'Acronym must be uppercase letters and numbers only',
   })
+  @ApiProperty({
+    description:
+      'Uppercase letters and numbers only - the department page resolves its route by lowercasing this, so it must also be unique.',
+    example: 'GIC',
+    maxLength: 10,
+  })
   acronym!: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Department logo. Usually set by uploading `image` as multipart instead.',
+  })
   @IsOptional()
   @IsUrl()
   image_url?: string;

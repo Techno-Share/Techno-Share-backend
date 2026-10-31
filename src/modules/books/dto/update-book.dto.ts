@@ -7,35 +7,50 @@ import {
   MaxLength,
   Matches,
 } from 'class-validator';
-
-// Letters (any language, incl. Khmer marks), numbers, spaces and hyphens.
-const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s_-]+$/u;
-// Free text that simply must not contain template-injection characters.
-const NO_FORBIDDEN_PATTERN = /^[^${}]*$/;
-const FORBIDDEN_MESSAGE = 'Must not contain $, { or }';
+import {
+  NO_TEMPLATE_CHARS_MESSAGE,
+  NO_TEMPLATE_CHARS_PATTERN,
+  TITLE_MESSAGE,
+  TITLE_PATTERN,
+} from '../../../common/dto/text-patterns';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdateBookDto {
+  @ApiPropertyOptional({
+    description: 'New title.',
+    maxLength: 200,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(200)
-  @Matches(TITLE_PATTERN, {
-    message: 'Title must not contain special characters',
-  })
+  @Matches(TITLE_PATTERN, { message: TITLE_MESSAGE })
   title?: string;
 
   /** '' clears it — the "Other" choice. */
+  @ApiPropertyOptional({
+    description: 'New department, or an empty string for none.',
+    format: 'uuid',
+  })
   @IsOptional()
   @ValidateIf((o: UpdateBookDto) => o.department !== '')
   @IsUUID('4', { message: 'Department must be a valid selection' })
   department?: string;
 
+  @ApiPropertyOptional({
+    description: 'New description.',
+    maxLength: 1000,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(1000)
-  @Matches(NO_FORBIDDEN_PATTERN, { message: FORBIDDEN_MESSAGE })
+  @Matches(NO_TEMPLATE_CHARS_PATTERN, { message: NO_TEMPLATE_CHARS_MESSAGE })
   description?: string;
 
   /** Omit to keep the current cover; a book is never without one. */
+  @ApiPropertyOptional({
+    description: 'New cover, from POST /books/upload-cover.',
+    maxLength: 2000,
+  })
   @IsOptional()
   @IsString()
   @IsNotEmpty({ message: 'Cover image is required' })

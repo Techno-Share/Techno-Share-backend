@@ -7,7 +7,7 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
-  ServiceUnavailableException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, LessThan, Repository } from 'typeorm';
@@ -18,7 +18,6 @@ import { StagedFile } from './entities/staged-file.entity';
 import { User } from '../users/entities/user.entity';
 import { Major } from '../majors/entities/major.entity';
 import { BUCKETS, StorageService } from '../storage/storage.service';
-import { OfficeConvertService } from '../storage/office-convert.service';
 import { pgCode } from '../../common/utils/pg-error';
 import { LANGUAGE_MAJOR_ACRONYMS } from './constants/majors';
 import { decodeUploadName } from './utils/upload-name';
@@ -35,7 +34,6 @@ import { QueryDocumentsDto } from './dto/query-documents.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ImageOptimizeService } from '../storage/image-optimize.service';
 import { UploadQuotaService } from '../../common/rate-limit/upload-quota.service';
-import { ClamAvService } from '../../common/security/clamav.service';
 import {
   isProcessableImage,
   validateFileContent,
@@ -51,8 +49,40 @@ const DEFAULT_PAGE_SIZE = 24;
 /** Review state of a single file — see DocumentFile.status. */
 type DocumentStatus = 'pending' | 'active' | 'rejected';
 
+/**
+ * ── UPLOAD SECURITY POLICY ───────────────────────────────────────────────
+ *
+ * Uploaded files are NOT scanned for malware. The ClamAV container was
+ * removed deliberately to cut roughly 2 GB of resident memory and a
+ * multi-minute cold start; the operator of this deployment has accepted the
+ * residual risk in exchange for being able to run on a smaller instance.
+ *
+ * What remains is TYPE ENFORCEMENT, not malware detection. The pipeline can
+ * prove a file is the format its name claims and nothing else:
+ *
+ *   1. size      — 50 MB per file, 10 files per batch, refused by multer
+ *   2. signature — magic bytes read from the uploaded buffer, which must
+ *                  agree with the extension (see utils/file-signature.ts)
+ *   3. structure — container formats are opened far enough to prove they are
+ *                  really archives, not a four-byte header with junk behind it
+ *
+ * A genuine, correctly-typed PDF carrying an exploit passes all three. That
+ * is the accepted risk, and it is stated here rather than in a document
+ * nobody reads while editing this file.
+ *
+ * Two consequences this code must preserve:
+ *
+ *   - Nothing anywhere may describe a stored file as scanned, clean or safe.
+ *     The absence of a verdict must never be recorded as a passing one.
+ *   - Objects are served with `Content-Disposition: attachment` unless the
+ *     format is one a browser renders inertly (see inlineSafe). Validation
+ *     stops an active payload being stored; disposition stops a stored one
+ *     being executed in our origin if it ever were.
+ */
+const MALWARE_SCANNING_ENABLED = false as const;
+
 @Injectable()
-export class DocumentsService {
+export class DocumentsService implements OnModuleInit {
   constructor(
     @InjectRepository(Upload)
     private readonly uploads: Repository<Upload>,
@@ -69,13 +99,29 @@ export class DocumentsService {
     @InjectRepository(UploadPin)
     private readonly uploadPins: Repository<UploadPin>,
     private readonly storage: StorageService,
-    private readonly officeConvert: OfficeConvertService,
     private readonly images: ImageOptimizeService,
     private readonly quota: UploadQuotaService,
-    private readonly clamav: ClamAvService,
   ) {}
 
   private readonly securityLog = new Logger('UploadSecurity');
+
+  /**
+   * Announce the upload-security posture once, at boot.
+   *
+   * Deliberately a WARN and not a debug line: "this deployment stores files
+   * nobody scanned" is the single most important thing an operator can know
+   * about this service, and it must not have to be inferred from the absence
+   * of a ClamAV container in `docker ps`.
+   */
+  onModuleInit(): void {
+    if (!MALWARE_SCANNING_ENABLED) {
+      this.securityLog.warn(
+        'Malware scanning is NOT performed — uploads are accepted on ' +
+          'signature and structure checks alone. Stored files must never be ' +
+          'described as scanned or clean.',
+      );
+    }
+  }
 
   /**
    * Confirm a file is what it claims to be, and bound it if it is an image.
@@ -100,38 +146,9 @@ export class DocumentsService {
       throw new BadRequestException('Unsupported or invalid file type.');
     }
 
-    // Scanned here: after the bytes are confirmed to be a type we accept, and
-    // before anything is written or re-encoded. The ORIGINAL buffer is what
-    // goes to clamd — that is what the uploader sent, and for everything except
-    // images it is also exactly what will be stored.
-    const scan = await this.clamav.scan(file.buffer);
-
-    if (scan.status === 'infected') {
-      this.securityLog.warn(
-        `upload rejected user=${uploaderId} size=${file.size} ` +
-          `declared=${file.mimetype} reason=malware signature=${scan.signature}`,
-      );
-      // The signature name stays in the log. Telling an uploader which rule
-      // fired is a tuning hint for anyone probing the scanner, and means
-      // nothing to a student who picked the wrong file.
-      throw new BadRequestException(
-        'This file was rejected by the malware scanner.',
-      );
-    }
-
-    if (scan.status === 'unavailable') {
-      // Fail closed. An unscanned upload would be indistinguishable from a
-      // scanned one once stored, so "the scanner was down" must not quietly
-      // become "the file is fine". The operator sees this at ERROR; the
-      // uploader sees a retryable 503.
-      this.securityLog.error(
-        `upload refused user=${uploaderId} size=${file.size} ` +
-          `reason=scanner-unavailable detail=${scan.reason}`,
-      );
-      throw new ServiceUnavailableException(
-        'File scanning is temporarily unavailable. Please try again shortly.',
-      );
-    }
+    // No malware scan runs here — see MALWARE_SCANNING_ENABLED above. The file
+    // has been proved to be the format it claims; it has NOT been proved
+    // harmless, and no later step may imply otherwise.
 
     if (isProcessableImage(verdict.kind)) {
       const optimized = await this.images.optimizeOrOriginal(
@@ -215,11 +232,11 @@ export class DocumentsService {
   }
 
   /**
-   * Restrict a feed query to uploads the viewer is allowed to see. A viewer
-   * sees an upload when it's public, they uploaded it, they're an admin, or
-   * their department/year matches the upload's audience rule. Applied as an
-   * AND on the query builder (`u` is the uploads alias). `paramPrefix` keeps
-   * bound params unique if this is ever called twice on one builder.
+   * Restrict a feed query to uploads the viewer may see.
+   *
+   * A viewer sees an upload when it has no audience, they uploaded it, they are
+   * an admin, or any cohort they have been in matches the audience. Added as an
+   * AND on the query builder, where `u` is the uploads alias.
    */
   private applyVisibility(
     qb: import('typeorm').SelectQueryBuilder<Upload>,
@@ -493,31 +510,20 @@ export class DocumentsService {
   // POST /documents then claims them by id.
 
   /**
-   * Office files can't be previewed by browsers directly — render a PDF beside
-   * the original (best effort). A failure leaves the preview null; the upload
-   * still succeeds.
+   * Office documents are NOT converted to PDF.
+   *
+   * A headless LibreOffice used to render a .docx/.pptx into a PDF beside the
+   * original so the browser could preview it inline. It was removed for the
+   * same reason the malware scanner was: it parsed untrusted uploads in-process
+   * — the largest such surface left in the service once clamd was gone — and it
+   * dragged LibreOffice plus five font packages into the production image for a
+   * convenience feature.
+   *
+   * Office files therefore have no rendition and are offered as a download.
+   * Rows uploaded BEFORE this change still carry `preview_key`, and that path
+   * is deliberately left intact: signFileAccess still prefers a rendition when
+   * one exists, so old documents keep previewing and new ones simply do not.
    */
-  private async buildPreview(baseKey: string, file: Express.Multer.File) {
-    const sourceName = decodeUploadName(file.originalname);
-    if (!this.officeConvert.canConvert(sourceName))
-      return { url: null, key: null };
-
-    const pdf = await this.officeConvert.toPdf(file.buffer, sourceName);
-    if (!pdf) return { url: null, key: null };
-
-    const key = `${baseKey}.preview.pdf`;
-    try {
-      const url = await this.storage.upload(
-        BUCKETS.DOCUMENTS,
-        key,
-        pdf,
-        'application/pdf',
-      );
-      return { url, key };
-    } catch {
-      return { url: null, key: null }; // upload failed — nothing to clean up
-    }
-  }
 
   /** How long an unclaimed staged file survives before the sweep removes it. */
   private static readonly STAGED_TTL_HOURS = 24;
@@ -556,7 +562,6 @@ export class DocumentsService {
       ? originalName.split('.').pop()!
       : null;
     const key = this.buildKey(`staged/${uploaderId}`, ext);
-    const baseKey = key.replace(/\.[^.]*$/, '');
 
     let fileUrl: string;
     try {
@@ -571,7 +576,11 @@ export class DocumentsService {
       throw new InternalServerErrorException('File upload failed');
     }
 
-    const preview = await this.buildPreview(baseKey, file);
+    // No rendition is produced — see the note above buildPreview's removal.
+    const preview: { url: string | null; key: string | null } = {
+      url: null,
+      key: null,
+    };
 
     try {
       const staged = await this.stagedFiles.save(
@@ -877,7 +886,6 @@ export class DocumentsService {
       ? originalName.split('.').pop()!
       : null;
     const key = this.buildKey(`${majorId}/${uploaderId}`, ext);
-    const baseKey = key.replace(/\.[^.]*$/, '');
 
     let fileUrl: string;
     try {
@@ -892,10 +900,11 @@ export class DocumentsService {
       throw new InternalServerErrorException('File upload failed');
     }
 
-    const { url: previewUrl, key: previewKey } = await this.buildPreview(
-      baseKey,
-      file,
-    );
+    // No rendition is produced — see the note above buildPreview's removal.
+    // Written as nulls rather than omitted so the row shape is unchanged and
+    // the legacy reader paths keep working against documents that have one.
+    const previewUrl = null;
+    const previewKey = null;
 
     try {
       const doc = await this.documents.save(
@@ -905,7 +914,7 @@ export class DocumentsService {
           // The canonical refs. file_url stays for legacy readers; everything
           // that grants access reads these.
           storage_key: `${BUCKETS.DOCUMENTS}/${key}`,
-          preview_key: previewKey ? `${BUCKETS.DOCUMENTS}/${previewKey}` : null,
+          preview_key: previewKey,
           preview_url: previewUrl,
           original_name: originalName,
           file_size_kb: Math.round(buffer.length / 1024),
@@ -933,10 +942,8 @@ export class DocumentsService {
         status: doc.status,
       };
     } catch {
-      await this.storage.remove([
-        `${BUCKETS.DOCUMENTS}/${key}`,
-        ...(previewKey ? [`${BUCKETS.DOCUMENTS}/${previewKey}`] : []),
-      ]);
+      // Only the object just written — there is no rendition beside it now.
+      await this.storage.remove([`${BUCKETS.DOCUMENTS}/${key}`]);
       await this.quota.refund(uploaderId, ingressBytes);
       throw new InternalServerErrorException('Failed to save document record');
     }
@@ -1158,7 +1165,15 @@ export class DocumentsService {
    * matter what they are named.
    */
   private inlineSafe(ref: string | null | undefined): boolean {
-    return /\.(pdf|jpe?g|png|gif|webp)$/i.test(ref ?? '');
+    // Exactly the formats the upload allowlist admits AND a browser renders
+    // without executing anything: a PDF in its sandboxed viewer, and the two
+    // raster images. Everything else — archives, Office files, anything on a
+    // legacy row — is served `attachment` and cannot run in our origin.
+    //
+    // gif and webp were listed here once. Neither can be uploaded, so they
+    // only ever matched rows predating the current allowlist, and widening
+    // the inline set for files nobody can create is a cost with no benefit.
+    return /\.(pdf|jpe?g|png)$/i.test(ref ?? '');
   }
 
   private async signOrFallback(

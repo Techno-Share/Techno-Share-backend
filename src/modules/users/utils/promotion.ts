@@ -13,10 +13,21 @@ import {
  * way anybody advances — which also means nobody advances until an admin says
  * so.
  *
- * The advance is applied lazily — on the student's next visit after the moment
- * passes, not by a scheduled job. There is no scheduler in this app, and a lazy
- * rule survives the server being down at the appointed time and catches students
- * who were away, which a cron firing once would not.
+ * The advance is applied lazily, on the student's next visit after the moment
+ * passes, rather than by a batch job at the moment itself. A cron was available
+ * — AdminScheduler already runs one hourly — and was still the wrong tool here:
+ *
+ *  - Foundation year 2 cannot be advanced without asking which department the
+ *    student joined, so an interactive path has to exist regardless. A batch
+ *    job would be a second mechanism doing the same work, and the two could
+ *    disagree.
+ *  - `promoted_to_year` is set by the same write that advances the year, so
+ *    "congratulate them once" needs no extra flag.
+ *  - isRolloverDue is a comparison over stored state, so it can be asked any
+ *    number of times and corrects itself. A batch UPDATE happens once.
+ *
+ * The cost is that `users.year_level` trails reality until each student
+ * returns, so counts grouped by year under-report straight after a rollover.
  */
 
 /**
