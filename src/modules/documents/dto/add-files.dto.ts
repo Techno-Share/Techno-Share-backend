@@ -1,6 +1,7 @@
 import { Transform } from 'class-transformer';
 import { IsArray, IsOptional, IsUUID } from 'class-validator';
 import { parseJsonArray } from './create-document.dto';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
  * Body of POST /documents/:id/files. The files themselves may arrive as
@@ -8,6 +9,12 @@ import { parseJsonArray } from './create-document.dto';
  * a new upload.
  */
 export class AddFilesDto {
+  @ApiPropertyOptional({
+    description:
+      'Ids from POST /documents/staged-files to attach to this document. Either these or multipart `files` must be present.',
+    type: [String],
+    format: 'uuid',
+  })
   @IsOptional()
   @Transform(parseJsonArray)
   @IsArray()

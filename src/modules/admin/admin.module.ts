@@ -20,6 +20,7 @@ import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { Book } from '../books/entities/book.entity';
 import { BookRequest } from '../books/entities/book-request.entity';
 import { Notification } from '../notifications/entities/notification.entity';
+import { PromotionEvent } from '../users/entities/promotion-event.entity';
 import { Major } from '../majors/entities/major.entity';
 
 @Module({
@@ -36,6 +37,7 @@ import { Major } from '../majors/entities/major.entity';
       BookRequest,
       Notification,
       Major,
+      PromotionEvent,
     ]),
     BansModule,
     NotificationsModule,

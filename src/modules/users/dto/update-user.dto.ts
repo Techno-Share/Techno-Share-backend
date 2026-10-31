@@ -11,35 +11,53 @@ import {
   IsUrl,
   MaxLength,
 } from 'class-validator';
+import {
+  PERSON_NAME_MESSAGE,
+  PERSON_NAME_PATTERN,
+} from '../../../common/dto/text-patterns';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
  * Same rule as registration — see RegisterDto for why the Khmer block sits in
  * the first position too. Enforced here as well so the profile editor cannot
  * be used to set a name that sign-up would have refused.
  */
-const NAME_PATTERN = /^[A-Zក-៿][A-Za-zក-៿]*$/;
-
-const NAME_MESSAGE =
-  'Name must start with a capital letter and contain no spaces, ' +
-  'digits or symbols';
 
 export class UpdateUserDto {
+  @ApiPropertyOptional({
+    description: 'New given name.',
+    maxLength: 50,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(50)
-  @Matches(NAME_PATTERN, { message: NAME_MESSAGE })
+  @Matches(PERSON_NAME_PATTERN, { message: PERSON_NAME_MESSAGE })
   first_name?: string;
 
+  @ApiPropertyOptional({
+    description: 'New family name.',
+    maxLength: 50,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(50)
-  @Matches(NAME_PATTERN, { message: NAME_MESSAGE })
+  @Matches(PERSON_NAME_PATTERN, { message: PERSON_NAME_MESSAGE })
   last_name?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Department. Settable once through the welcome page; with year_level it decides which documents are visible.',
+    format: 'uuid',
+  })
   @IsOptional()
   @IsUUID()
   major_id?: string;
 
+  @ApiPropertyOptional({
+    description: 'Year level. Foundation runs 1-2, departments 3-5.',
+    minimum: 1,
+    maximum: 5,
+  })
   @IsOptional()
   @IsInt()
   @Min(1)
@@ -62,6 +80,9 @@ export class UpdateUserDto {
    * Tightening that means comparing against S3_PUBLIC_URL, which is a
    * deployment value and would invalidate stored avatars if it ever changed.
    */
+  @ApiPropertyOptional({
+    description: 'Profile photo URL. POST /users/avatar returns one.',
+  })
   @IsOptional()
   @IsUrl({ require_tld: false })
   avatar_url?: string;
@@ -73,6 +94,11 @@ export class UpdateUserDto {
   @IsOptional()
   @IsString()
   @MaxLength(200)
+  @ApiPropertyOptional({
+    description:
+      'The handle in use for notifications, as @name or a t.me link.',
+    example: '@sophea',
+  })
   @Matches(
     /^$|^@?[A-Za-z0-9_]{4,32}$|^(https?:\/\/)?t\.me\/[A-Za-z0-9_]{4,32}$/,
     {
@@ -93,6 +119,10 @@ export class UpdateUserDto {
   @Matches(/^@?[A-Za-z0-9_]{4,32}$|^(https?:\/\/)?t\.me\/[A-Za-z0-9_]{4,32}$/, {
     each: true,
     message: 'Enter a Telegram username like @student or a t.me link',
+  })
+  @ApiPropertyOptional({
+    description: 'Every saved handle. `telegram` must be one of them.',
+    type: [String],
   })
   telegram_handles?: string[];
 }

@@ -20,6 +20,27 @@ import {
 } from './dto/email-flows.dto';
 import { RateLimitTier } from '../../common/rate-limit/rate-limit.decorator';
 import { contextFrom } from '../../common/alerts/request-context';
+import {
+  ApiBadRequestResponse,
+  ApiConflictResponse,
+  ApiCookieAuth,
+  ApiCreatedResponse,
+  ApiForbiddenResponse,
+  ApiFoundResponse,
+  ApiOkResponse,
+  ApiOperation,
+  ApiTags,
+  ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
+import {
+  ApiRateLimited,
+  ERROR_SCHEMA,
+  envelope,
+} from '../../common/swagger/api-responses.decorator';
+import {
+  API_TAGS,
+  REFRESH_COOKIE_AUTH,
+} from '../../common/swagger/swagger.config';
 
 const REFRESH_COOKIE = 'refresh_token';
 // Short-lived, and only exists between the redirect out and the callback back.
@@ -44,6 +65,7 @@ function readRefreshCookie(req: Request): string | undefined {
   return cookies?.[REFRESH_COOKIE];
 }
 
+@ApiTags(API_TAGS.auth)
 @Controller('auth')
 export class AuthController {
   constructor(private authService: AuthService) {}
@@ -59,6 +81,32 @@ export class AuthController {
    * address unproven — an account was usable the moment somebody typed an
    * address they did not own. The caller now gets a message and an email.
    */
+  @ApiOperation({
+    summary: 'Create an account',
+    description:
+      'Creates the account and emails a six-digit code. It does NOT sign anyone in and returns no token — the address is unproven until the code is confirmed, and login refuses until then. Student id, department and year are not collected here; the welcome page sets them afterwards.',
+  })
+  @ApiCreatedResponse({
+    description: 'Account created and the verification email sent.',
+    schema: envelope({
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          example: 'Check your email for the verification code',
+        },
+      },
+    }),
+  })
+  @ApiBadRequestResponse({
+    description: 'Validation failed.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiConflictResponse({
+    description: 'That email is already registered.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('signup')
   @Post('register')
   async register(@Body() dto: RegisterDto, @Req() req: Request) {
@@ -73,6 +121,27 @@ export class AuthController {
    * The per-code attempt cap in the service is the real control; this bounds
    * how fast someone can burn through codes to get more attempts.
    */
+  @ApiOperation({
+    summary: 'Confirm an email address',
+    description:
+      'Redeems the six-digit code from the sign-up email and signs the account in: the access token comes back in the body and the refresh cookie is set, so a confirmed address goes straight into the app. A code allows five attempts before it is burned.',
+  })
+  @ApiOkResponse({
+    description: 'Address confirmed. Sets the `refresh_token` cookie.',
+    schema: envelope({
+      type: 'object',
+      properties: {
+        message: { type: 'string' },
+        user: { type: 'object', additionalProperties: true },
+        token: { type: 'string', description: 'Access token (JWT).' },
+      },
+    }),
+  })
+  @ApiBadRequestResponse({
+    description: 'Wrong or expired code, or the attempt cap was reached.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('email-code')
   @Post('verify-email')
   @HttpCode(200)
@@ -96,6 +165,19 @@ export class AuthController {
   }
 
   /** Send the verification link again. Answers the same for any address. */
+  @ApiOperation({
+    summary: 'Resend the verification code',
+    description:
+      'Answers the same for any address, registered or not, so this cannot be used to discover who has an account.',
+  })
+  @ApiOkResponse({
+    description: 'Always the same acknowledgement.',
+    schema: envelope({
+      type: 'object',
+      properties: { message: { type: 'string' } },
+    }),
+  })
+  @ApiRateLimited()
   @RateLimitTier('email-send')
   @Post('resend-verification')
   @HttpCode(200)
@@ -104,6 +186,19 @@ export class AuthController {
   }
 
   /** Start a password reset. Answers the same for any address. */
+  @ApiOperation({
+    summary: 'Start a password reset',
+    description:
+      'Emails a six-digit reset code. Answers the same for any address, registered or not.',
+  })
+  @ApiOkResponse({
+    description: 'Always the same acknowledgement.',
+    schema: envelope({
+      type: 'object',
+      properties: { message: { type: 'string' } },
+    }),
+  })
+  @ApiRateLimited()
   @RateLimitTier('email-send')
   @Post('forgot-password')
   @HttpCode(200)
@@ -119,6 +214,23 @@ export class AuthController {
    * guess still counts against the same five-attempt cap — a check that did
    * not count would be an unlimited oracle.
    */
+  @ApiOperation({
+    summary: 'Check a reset code without spending it',
+    description:
+      'Lets the client confirm a code before collecting a new password. A wrong guess still counts against the same five-attempt cap, so this is not an unlimited oracle.',
+  })
+  @ApiOkResponse({
+    description: 'The code is valid and still unspent.',
+    schema: envelope({
+      type: 'object',
+      properties: { message: { type: 'string' } },
+    }),
+  })
+  @ApiBadRequestResponse({
+    description: 'Wrong or expired code, or the attempt cap was reached.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('email-code')
   @Post('reset-code/check')
   @HttpCode(200)
@@ -137,6 +249,23 @@ export class AuthController {
    * can type the new one — which also means an abandoned reset leaves no
    * logged-in tab behind.
    */
+  @ApiOperation({
+    summary: 'Finish a password reset',
+    description:
+      'Sets the new password and revokes every existing session. Deliberately does NOT sign the caller in — the password was set by someone who could not produce the old one, so they must now type the new one.',
+  })
+  @ApiOkResponse({
+    description: 'Password changed and all sessions revoked.',
+    schema: envelope({
+      type: 'object',
+      properties: { message: { type: 'string' } },
+    }),
+  })
+  @ApiBadRequestResponse({
+    description: 'Wrong or expired code, or the attempt cap was reached.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('email-code')
   @Post('reset-password')
   @HttpCode(200)
@@ -149,6 +278,30 @@ export class AuthController {
     );
   }
 
+  @ApiOperation({
+    summary: 'Sign in',
+    description:
+      'Returns a short-lived access token in the body and sets the long-lived `refresh_token` cookie (httpOnly, Secure, SameSite=None). Refused while the address is unconfirmed, and while the account is banned.',
+  })
+  @ApiOkResponse({
+    description: 'Signed in. Sets the `refresh_token` cookie.',
+    schema: envelope({
+      type: 'object',
+      properties: {
+        user: { type: 'object', additionalProperties: true },
+        token: { type: 'string', description: 'Access token (JWT).' },
+      },
+    }),
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Wrong credentials, or the address is not yet confirmed.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiForbiddenResponse({
+    description: 'The account is banned.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('auth')
   @Post('login')
   @HttpCode(200)
@@ -189,6 +342,13 @@ export class AuthController {
    *
    * googleCallback below has always used plain `@Res()` for the same reason.
    */
+  @ApiOperation({
+    summary: 'Start Google sign-in',
+    description:
+      'Redirects the browser to Google and sets a short-lived `g_oauth_state` cookie the callback checks. Open this in a browser — it answers with a 302, not JSON, so it cannot be exercised from this page.',
+  })
+  @ApiFoundResponse({ description: "Redirect to Google's consent screen." })
+  @ApiRateLimited()
   @Get('google')
   googleRedirect(@Res() res: Response) {
     const state = randomBytes(16).toString('hex');
@@ -213,6 +373,16 @@ export class AuthController {
    * httpOnly refresh cookie rather than a token in the URL, which would end up
    * in browser history and in any referrer.
    */
+  @ApiOperation({
+    summary: 'Google sign-in callback',
+    description:
+      'Where Google returns the browser. Always ends in a redirect to the SPA, never JSON: the session travels in the httpOnly refresh cookie rather than a token in the URL, which would be left in history and referrers. Called by Google, not by clients.',
+  })
+  @ApiFoundResponse({
+    description:
+      'Redirect back to the frontend, with the refresh cookie set on success.',
+  })
+  @ApiRateLimited()
   @RateLimitTier('oauth')
   @Get('google/callback')
   async googleCallback(
@@ -259,6 +429,24 @@ export class AuthController {
     }
   }
 
+  @ApiOperation({
+    summary: 'Exchange the refresh cookie for a new access token',
+    description:
+      'Reads the `refresh_token` cookie — not a bearer token — and rotates it: the old token is consumed and a new one is set. Reusing a consumed token revokes the whole family, which is how a stolen cookie is contained. Cannot be called from this page, since scripts cannot set an httpOnly cookie.',
+  })
+  @ApiCookieAuth(REFRESH_COOKIE_AUTH)
+  @ApiOkResponse({
+    description: 'New access token issued and the cookie rotated.',
+    schema: envelope({
+      type: 'object',
+      properties: { token: { type: 'string' } },
+    }),
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing, expired, already-used or revoked refresh token.',
+    schema: ERROR_SCHEMA,
+  })
+  @ApiRateLimited()
   @RateLimitTier('refresh')
   @Post('refresh')
   @HttpCode(200)
@@ -277,6 +465,19 @@ export class AuthController {
     return { token: accessToken };
   }
 
+  @ApiOperation({
+    summary: 'Sign out',
+    description:
+      'Revokes the refresh token in the cookie and clears it. Succeeds even when no cookie is present, so a client can always reach a signed-out state.',
+  })
+  @ApiCookieAuth(REFRESH_COOKIE_AUTH)
+  @ApiOkResponse({
+    description: 'Session revoked and the cookie cleared.',
+    schema: envelope({
+      type: 'object',
+      properties: { message: { type: 'string', example: 'Logged out' } },
+    }),
+  })
   @Post('logout')
   @HttpCode(200)
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {

@@ -1,4 +1,5 @@
 import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { ApiProperty } from '@nestjs/swagger';
 
 export class DeclineRequestDto {
   /**
@@ -8,6 +9,10 @@ export class DeclineRequestDto {
    * The pattern is what actually enforces it — IsNotEmpty passes a string of
    * spaces, which would store as an empty reason once trimmed.
    */
+  @ApiProperty({
+    description: 'Shown to the requester so a refusal is not silent.',
+    example: 'Already promised to another student',
+  })
   @IsString()
   @IsNotEmpty({ message: 'Tell the requester why you are declining' })
   @Matches(/\S/, { message: 'Tell the requester why you are declining' })

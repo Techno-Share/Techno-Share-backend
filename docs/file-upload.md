@@ -43,10 +43,10 @@ What happens per call, in order:
 | 3. Decode the name       | `decodeUploadName()` — multipart filenames arrive latin1-decoded, so `តេស្ត.png` would otherwise be stored mangled. Guarded: bytes that are not valid UTF-8 are handed back untouched rather than corrupted twice.                                                                                                                                                                                                      |
 | 4. Reserve quota         | The per-user byte budget is charged the bytes **received**, before anything expensive runs. Charging the stored size instead would leave the abuse this bounds — pushing volume at the server — wide open, since Sharp can shrink a 20 MB photo to 200 KB. A file rejected at step 5 stays charged, deliberately: otherwise invalid bytes would be free to send without limit. Refunded only if the write itself fails. |
 | 5. Validate the bytes    | `validateFileContent()` reads the magic bytes and confirms they match the extension. A `.jpg` carrying HTML is refused here, before anything is written.                                                                                                                                                                                                                                                                |
-| 6. Scan for malware      | The original buffer is streamed to `clamd` (INSTREAM). Infected → `400`, with the signature name in the log and not in the response. Scanner unreachable → `503`: an unscanned upload is refused, never stored.                                                                                                                                                                                                         |
+| 6. Check the structure   | Container formats are opened far enough to prove they are real: a ZIP must have a parseable central directory, and a `.docx`/`.pptx` must contain `[Content_Types].xml`. A four-byte header with junk behind it is refused here. **No malware scan runs** — see below.                                                                                                                                                  |
 | 7. Optimise, if an image | JPEG/PNG go through Sharp: capped at 1920px on the longest edge, never upscaled, metadata stripped by the re-encode. Everything else is stored byte-for-byte.                                                                                                                                                                                                                                                           |
 | 8. Put the object        | Key is `staged/<uploaderId>/<uuid>.<ext>` in the private `documents` bucket — a v4 UUID, carrying nothing of the original filename.                                                                                                                                                                                                                                                                                     |
-| 9. Build a preview       | Office files only (`ppt pptx doc docx …`) — LibreOffice renders a PDF beside the original, 60 s timeout. **Best effort**: on failure `preview_url` stays null and the upload still succeeds.                                                                                                                                                                                                                            |
+| 9. Build a preview       | Office files only (`ppt pptx doc docx …`) — LibreOffice renders a PDF beside the original: 45 s timeout killed with SIGKILL, inputs over 25 MB skipped, renditions over 60 MB discarded, at most 2 conversions at once. **Best effort**: on failure `preview_url` stays null and the upload still succeeds.                                                                                                              |
 | 10. Record the handle    | A `staged_files` row: `file_url`, `storage_key`, `preview_url`, `preview_key`, `original_name`, `file_size_kb`.                                                                                                                                                                                                                                                                                                         |
 
 If the row fails to save, the objects just written are removed again — a staged
@@ -244,8 +244,8 @@ waiting for review"_ rather than implying it is live.
 | Office conversion fails         | upload succeeds, `preview_url` null                                     |
 | Unknown / foreign staged id     | `400`, no upload created                                                |
 | Bytes fail signature validation | `400` generic message; detail to the log only                           |
-| Malware detected                | `400`; nothing written. The signature name goes to the log only         |
-| Scanner unreachable             | `503`, retryable; nothing written — fail closed, never stored unscanned |
+| Archive has no central directory | `400` generic message; `malformed-archive` to the log only             |
+| `.docx`/`.pptx` is not an OOXML package | `400`; `not-an-office-document` to the log only                 |
 | Byte quota exhausted            | `429` with `Retry-After`; nothing written                               |
 | Image is a decompression bomb   | refused before decoding                                                 |
 | Image optimisation fails        | original bytes stored — a sharp failure does not cost an upload         |
@@ -263,71 +263,58 @@ waiting for review"_ rather than implying it is live.
 | Object put/remove, bucket names, public URL               | `src/modules/storage/storage.service.ts`        |
 | Office → PDF preview                                      | `src/modules/storage/office-convert.service.ts` |
 | Filename decoding                                         | `src/modules/documents/utils/upload-name.ts`    |
-| Malware scanning                                          | `src/common/security/clamav.service.ts`         |
+| Signature + structure validation                          | `src/modules/documents/utils/file-signature.ts` |
 | Approve / reject                                          | `src/modules/admin/admin.service.ts`            |
 
 ---
 
 ## Malware scanning
 
-`clamd` runs as its own container and is reached over TCP on 3310. The API
-streams each uploaded buffer to it with INSTREAM, after the magic-byte check
-and before the object is written, so an infected file never reaches storage.
+**There is none.** The ClamAV container was removed deliberately: it held
+roughly 2 GB resident for its signature database and took minutes to become
+healthy on a cold start, which is the difference between this stack fitting a
+small instance and not. The operator of this deployment has accepted the
+residual risk in exchange for that.
 
-**The original bytes are what get scanned**, not the optimised ones. That is
-what the uploader sent, and for everything except images it is also exactly
-what will be stored.
+What this means precisely:
 
-### Fail closed, deliberately
+- **Uploaded files are not scanned for malware.** Nothing in the system may
+  describe a stored file as scanned, clean, safe or verified.
+- A genuine, correctly-typed PDF carrying an exploit **passes every check we
+  perform**. Type enforcement is not malware detection and must not be
+  described as though it were.
+- There is no scanner to be unavailable, so there is no `503` for one. A
+  failure to *validate* is a `400`; a failure to *store* is a `500`. The two
+  are kept distinct on purpose — see the failure table above.
 
-If clamd cannot be reached, the upload is refused with `503` — it is not stored
-unscanned. Once a file is in the bucket nothing marks it as having skipped the
-scanner, so "the scanner was down" would silently become "this file is fine".
+What remains, and what it is actually worth:
 
-The escape hatch is explicit: `CLAMAV_ENABLED=false` turns scanning off
-entirely, and logs a warning on every boot. Either the control is there or it
-has been switched off on purpose; it is never quietly absent.
+| Control | Proves | Does not prove |
+| --- | --- | --- |
+| Size caps | The file is within 50 MB, and the batch within 10 | Anything about content |
+| Magic bytes | The bytes are the format the **extension** claims | That the content is benign |
+| Container structure | A ZIP is a real archive; a `.docx` is an OOXML package | That the archive's contents are safe |
+| `Content-Disposition` | A stored file cannot execute in our origin | That it is harmless once downloaded |
 
-Two deadlines, not one. `CLAMAV_CONNECT_TIMEOUT_MS` (3 s) covers reaching
-clamd; `CLAMAV_TIMEOUT_MS` (30 s) covers the scan itself. Conflating them is
-expensive in exactly the case that matters: a stopped container drops packets
-rather than refusing them, so without a separate connect deadline every upload
-waits the full scan timeout before failing. Measured: 30 s → 3 s.
+The second and third together close the stored-XSS path that motivated
+validation in the first place: HTML renamed to `.jpg` is refused by the
+signature check, and anything that is not `pdf`/`jpg`/`png` is served
+`attachment` rather than inline even if it were somehow stored.
 
-### Verifying it works
-
-Use EICAR — the industry-standard harmless test signature, not malware:
-
-```bash
-printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > eicar.com
-zip eicar.zip eicar.com          # .zip is an accepted type; clamd unpacks it
-# upload eicar.zip  -> 400 "This file was rejected by the malware scanner."
-```
-
-Wrap it in a **zip**, not a PDF. clamd parses a PDF structurally and will not
-find the signature pasted into one — that returns `OK`, which looks like a
-broken scanner and is not. Archives are unpacked and scanned, so a zip is the
-honest end-to-end check.
-
-### Operational notes
-
-- The image is `clamav/clamav-debian`, not `clamav/clamav`: the Alpine variant
-  publishes amd64 only, and this has to run on both an Apple Silicon laptop and
-  an x86 server.
-- The signature database lives in the `clamav-data` volume. Without it,
-  freshclam re-downloads ~250 MB on every container create — slow, and ClamAV's
-  mirrors rate-limit, which can leave a scanner with no database at all.
-- clamd holds the database in memory (~1 GB). Budget for it.
-- First boot takes a few minutes before clamd answers; the compose healthcheck
-  has a 300 s `start_period` and the backend waits on it.
+Everything else is the uploader's responsibility and the downloader's risk,
+and the platform should say so where students can read it.
 
 ## Known gaps
 
-1. **Office previews trust LibreOffice with the file.** Conversion runs with a
-   60 s timeout in an isolated temp directory and a failure only costs the
-   preview, but the converter itself parses untrusted input, and it runs
-   _after_ the scan. Sandboxing it (a container with no network, a seccomp
-   profile) would bound that.
+1. **Office previews trust LibreOffice with the file.** Conversion is bounded
+   — 45 s then SIGKILL, 25 MB input ceiling, 60 MB output ceiling, at most two
+   at once, isolated temp directory removed in a `finally` — and a failure only
+   costs the preview. But the converter still parses untrusted input in-process,
+   and with no scanner ahead of it that is now the largest untrusted-input
+   surface in the service. Memory is capped at the container (`mem_limit` on the
+   backend replicas) because Node cannot set an rlimit on a child. Running it in
+   its own container with no network and a seccomp profile would bound it
+   properly.
 
 2. **The three image buckets are still public-read.** `user-avatar`,
    `subject-cover` and `book-covers` hold non-sensitive images rendered by plain

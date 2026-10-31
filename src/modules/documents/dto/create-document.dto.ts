@@ -15,6 +15,11 @@ import {
 } from 'class-validator';
 import { IsFutureDate } from '../validators/is-future-date';
 import { AudienceEntryDto } from './audience-entry.dto';
+import {
+  TITLE_MESSAGE,
+  TITLE_PATTERN,
+} from '../../../common/dto/text-patterns';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 // Multipart form-data can't carry a JSON array, so array fields are sent as a
 // JSON string (e.g. '["a","b"]') and parsed here; a value that's already an
@@ -96,21 +101,31 @@ export const LANGUAGE_DOC_TYPES = [
 
 export const DOC_TYPES = Object.values(DocType);
 
-// Letters (any language, incl. Khmer marks), numbers, spaces and hyphens —
-// at least one letter/number. No special characters.
-const TITLE_PATTERN = /^(?=.*[\p{L}\p{N}])[\p{L}\p{M}\p{N}\s_-]+$/u;
-
 export class CreateDocumentDto {
+  @ApiPropertyOptional({
+    description:
+      'Shown in the feed. Letters, numbers, spaces, underscores and hyphens.',
+    example: 'Signals and Systems - Chapter 3',
+    maxLength: 100,
+  })
   @IsString()
   @MaxLength(100)
-  @Matches(TITLE_PATTERN, {
-    message: 'Title must not contain special characters',
-  })
+  @Matches(TITLE_PATTERN, { message: TITLE_MESSAGE })
   title?: string;
 
+  @ApiProperty({
+    description:
+      'Must belong to the list its major offers: department courses use the department list, DFL uses the language list. GET /documents/types returns both.',
+    enum: DOC_TYPES,
+    example: 'Note',
+  })
   @IsEnum(DocType)
   doc_type: DocType;
 
+  @ApiProperty({
+    description: 'The department the document belongs to.',
+    format: 'uuid',
+  })
   @IsUUID()
   major_id: string;
 
@@ -119,21 +134,41 @@ export class CreateDocumentDto {
   // optional, so a department/year with no subjects yet could post one with no
   // subject at all. UpdateDocumentDto keeps its own optional copy — a metadata
   // edit may leave the subject alone.
+  @ApiProperty({
+    description:
+      'The subject it belongs to. Required - the feed groups by subject.',
+    format: 'uuid',
+  })
   @IsUUID()
   subject_id: string;
 
   // Optional free-text description (replaced tags).
+  @ApiPropertyOptional({
+    description: 'Free text shown on the detail page.',
+    maxLength: 500,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(500)
   description?: string;
 
+  @ApiProperty({
+    description: 'Year within the department.',
+    minimum: 1,
+    maximum: 5,
+    example: 4,
+  })
   @IsInt()
   @Type(() => Number)
   @Min(1)
   @Max(5)
   year_level: number;
 
+  @ApiPropertyOptional({
+    description: 'The academic year it was produced in.',
+    example: '2024-2025',
+    maxLength: 10,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(10)
@@ -143,6 +178,11 @@ export class CreateDocumentDto {
   // (multipart). Required in practice, but a doc belonging to a language course
   // carries no audience at all; since that depends on the major, emptiness is
   // checked in the service (DocumentsService.resolveAudience), not here.
+  @ApiPropertyOptional({
+    description:
+      'Who may see it, as (department, year) pairs. Over multipart send it as a JSON string. Omit or leave empty for a language course, which every student takes.',
+    type: [AudienceEntryDto],
+  })
   @IsOptional()
   @Transform(parseAudienceEntries)
   @IsArray()
@@ -151,6 +191,12 @@ export class CreateDocumentDto {
 
   // Files already sent to POST /documents/staged-files while the user was
   // filling in this form. Either these or multipart `files` must be present.
+  @ApiPropertyOptional({
+    description:
+      'Ids from POST /documents/staged-files, for files uploaded while the form was being filled in. Either these or multipart `files` must be present.',
+    type: [String],
+    format: 'uuid',
+  })
   @IsOptional()
   @Transform(parseJsonArray)
   @IsArray()
@@ -160,6 +206,11 @@ export class CreateDocumentDto {
   // Optional soft-expiry timestamp (ISO 8601). Omit = never expires. A new
   // upload can't start out already expired — the form sends the END of the
   // chosen local day, so "today" still counts as future.
+  @ApiPropertyOptional({
+    description:
+      'Soft expiry, ISO 8601. Omit for never. Must be in the future; once passed the document leaves the feed for everyone including its uploader.',
+    example: '2027-06-30T16:59:59.000Z',
+  })
   @IsOptional()
   @IsISO8601()
   @IsFutureDate({ message: 'expires_at must be in the future' })

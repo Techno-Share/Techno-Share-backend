@@ -1,4 +1,5 @@
 import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { ApiProperty } from '@nestjs/swagger';
 
 export class RejectDto {
   /**
@@ -18,6 +19,10 @@ export class RejectDto {
    * `Matches(/\S/)` is what actually enforces it — IsNotEmpty passes a string
    * of spaces, which stores as an empty reason the moment it is trimmed.
    */
+  @ApiProperty({
+    description: 'Shown to the uploader so they can fix and resubmit.',
+    example: 'Pages 4-7 are unreadable',
+  })
   @IsString()
   @IsNotEmpty({ message: 'Tell the uploader why it was rejected' })
   @Matches(/\S/, { message: 'Tell the uploader why it was rejected' })

@@ -2,11 +2,13 @@ import {
   ForbiddenException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from './entities/user.entity';
+import { PromotionEvent } from './entities/promotion-event.entity';
 import { BUCKETS, StorageService } from '../storage/storage.service';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { PromotionSettingsService } from '../settings/promotion-settings.service';
@@ -19,9 +21,13 @@ import {
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     @InjectRepository(User)
     private readonly users: Repository<User>,
+    @InjectRepository(PromotionEvent)
+    private readonly promotions: Repository<PromotionEvent>,
     @InjectRepository(DepartmentModerator)
     private readonly moderators: Repository<DepartmentModerator>,
     private readonly storage: StorageService,
@@ -38,7 +44,8 @@ export class UsersService {
 
     // getMe is the app's first call on every load, which makes it the natural
     // place to catch up on a promotion the student has not collected yet.
-    user = await this.applyPendingPromotion(user);
+    const promotion = await this.applyPendingPromotion(user);
+    user = promotion.user;
 
     // A count, not the list — the client is told THAT they moderate, never
     // which departments. Which ones is an authorisation detail and the server
@@ -86,6 +93,18 @@ export class UsersService {
       needs_department_choice:
         needsDepartmentChoice(user.major?.acronym, user.year_level) &&
         isRolloverDue(rolloverAt, user.promoted_rollover_at),
+      /**
+       * The year this request just moved the student up to, or null.
+       *
+       * Non-null on exactly one response: the one where the rollover was
+       * applied AND the year actually changed. The stamp written above makes
+       * the next call return null, so the client can show a notice once
+       * without needing to remember whether it already has.
+       *
+       * Null for the capped cases — year 5, and Foundation year 2, which gets
+       * the department prompt instead.
+       */
+      promoted_to_year: promotion.promotedToYear,
     };
   }
 
@@ -100,7 +119,9 @@ export class UsersService {
    *    department they joined, so getMe flags it and the client asks.
    *  - anyone else -> one year, capped at their major's final year.
    */
-  private async applyPendingPromotion(user: User): Promise<User> {
+  private async applyPendingPromotion(
+    user: User,
+  ): Promise<{ user: User; promotedToYear: number | null }> {
     const rolloverAt = await this.promotionSettings.rolloverAt();
     // The only promotion rule there is, now that the automatic July rollover is
     // gone. Tracked by instant rather than by year, so a second rollover inside
@@ -115,29 +136,115 @@ export class UsersService {
     // Nothing owed. Deliberately no write here: an unstamped account is one
     // that has not had this rollover yet, and recording the schedule against
     // it before the moment arrives is what used to skip the student entirely.
-    if (!rolloverDue) return user;
+    if (!rolloverDue) return { user, promotedToYear: null };
 
     // Foundation year 2: leave the stamp STALE on purpose. It is what getMe
     // reads to decide whether to ask, so stamping here would close out the
     // rollover before the student has told us which department they joined,
     // and the prompt would never appear. updateMe stamps it when they answer.
     if (needsDepartmentChoice(user.major?.acronym, user.year_level))
-      return user;
+      return { user, promotedToYear: null };
 
     // Record which rollover this was, so it fires once and a later one still can.
     const updates: Partial<User> = { promoted_rollover_at: rolloverAt };
+    // Read before the assign below mutates `user` — this is what decides
+    // whether anything actually happened from the student's point of view.
+    const previousYear = user.year_level;
+
     // An incomplete profile has no year to advance; the complete-profile prompt
     // collects the current one directly, so stamping alone is right.
-    if (user.year_level !== null) {
+    if (previousYear !== null) {
       updates.year_level = advanceYearLevel(
         user.major?.acronym,
-        user.year_level,
+        previousYear,
         1,
       );
     }
 
     await this.users.update({ id: user.id }, updates);
-    return Object.assign(user, updates);
+    Object.assign(user, updates);
+
+    /**
+     * Only a year that actually moved counts as a promotion.
+     *
+     * `advanceYearLevel` caps at the major's final year, so a year 5 student —
+     * or a Foundation year 2 one — is stamped as having received the rollover
+     * while staying put. Reporting that as a promotion would tell them
+     * something untrue and send them looking for a year that does not exist.
+     */
+    const nextYear = updates.year_level;
+    const promotedToYear =
+      previousYear !== null &&
+      nextYear !== undefined &&
+      nextYear !== null &&
+      nextYear > previousYear
+        ? nextYear
+        : null;
+
+    // Same condition the student is told about, so the log and the notice can
+    // never disagree. `rolloverAt` is non-null by here — isRolloverDue is false
+    // for a null schedule and we returned above — but it is checked rather than
+    // asserted, because the row is dated by it.
+    if (promotedToYear !== null && previousYear !== null && rolloverAt) {
+      await this.recordPromotion(
+        user,
+        previousYear,
+        promotedToYear,
+        rolloverAt,
+      );
+    }
+
+    return { user, promotedToYear };
+  }
+
+  /**
+   * Write the history row for a promotion that has just been applied.
+   *
+   * Best-effort on purpose. The advance is already committed by the update
+   * above, and `getMe` is the call the entire app waits on before it renders —
+   * so a failure to write the log must cost the row, not the student's session.
+   * It is also unrecoverable by retry: the stamp has been written, so this
+   * rollover will never come round again for them.
+   *
+   * `orIgnore` rather than a read-then-insert: two `getMe` calls can be in
+   * flight at once (two tabs, or the two replicas behind the load balancer) and
+   * both will see the rollover as due. The unique key on
+   * (user_id, rollover_at) is what decides which one records it, instead of a
+   * check that both would pass before either wrote.
+   */
+  private async recordPromotion(
+    user: User,
+    fromYear: number,
+    toYear: number,
+    rolloverAt: Date,
+  ): Promise<void> {
+    try {
+      await this.promotions
+        .createQueryBuilder()
+        .insert()
+        .values({
+          user_id: user.id,
+          from_year: fromYear,
+          to_year: toYear,
+          /**
+           * The department the promotion happened IN, captured now because the
+           * profile only ever holds the current one. A student's year 1 -> 2
+           * promotion happened in Foundation, and reading `major_id` back after
+           * they join a department would relabel it as that department's.
+           */
+          major_id: user.major_id ?? null,
+          rollover_at: rolloverAt,
+        })
+        .orIgnore()
+        .execute();
+    } catch (error) {
+      this.logger.warn(
+        `Promotion ${fromYear} -> ${toYear} applied for user ${user.id} but ` +
+          `could not be recorded: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+      );
+    }
   }
 
   async updateMe(userId: string, dto: UpdateUserDto) {

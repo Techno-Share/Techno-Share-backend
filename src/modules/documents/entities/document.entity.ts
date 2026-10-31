@@ -41,7 +41,8 @@ export class DocumentFile {
   preview_key: string | null;
 
   // PDF rendition for in-browser preview of office files (pptx/docx/xlsx),
-  // generated on upload via LibreOffice. Null for files that don't need one
+  // generated on upload by a LibreOffice conversion that no longer runs.
+  // Null for every file uploaded since, and for files that never needed one
   // (already-previewable pdf/images) or when conversion was unavailable/failed.
   @Column({ type: 'text', nullable: true })
   preview_url: string | null;

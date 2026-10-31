@@ -64,6 +64,19 @@ export class ListUsersDto extends SortableQueryDto {
   status?: (typeof USER_STATUSES)[number];
 }
 
+// ─── Promotions ──────────────────────────────────────────────────────────────
+
+/**
+ * The promotion history table — one row per scheduled rollover.
+ *
+ * Page and limit only. It carried `search` and `sortBy` while rows were
+ * individual students; a rollover has neither a name to match nor a second
+ * column worth ordering by, and the global ValidationPipe runs with
+ * `forbidNonWhitelisted`, so leaving them declared would accept parameters the
+ * service silently ignores.
+ */
+export class ListPromotionsDto extends PaginationQueryDto {}
+
 // ─── Documents ───────────────────────────────────────────────────────────────
 
 export const DOCUMENT_SORT_FIELDS = [

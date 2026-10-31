@@ -1,5 +1,6 @@
 import helmet from 'helmet';
 import type { RequestHandler } from 'express';
+import { SWAGGER_PATH } from '../swagger/swagger.config';
 
 /**
  * Response security headers.
@@ -13,17 +14,27 @@ import type { RequestHandler } from 'express';
  * default. A default can change between major versions; a posture should not
  * change because a dependency was bumped.
  */
-export function securityHeaders(): RequestHandler {
+
+/** Everything served under here is Swagger UI. */
+const DOCS_PREFIX = `/${SWAGGER_PATH}`;
+
+/**
+ * The headers every API response carries.
+ *
+ * Split from the docs policy below so the strict one stays strict: Swagger UI
+ * needs to load a stylesheet and run a script, and granting that to the whole
+ * API to serve one page would be the wrong trade.
+ */
+function apiHeaders(): RequestHandler {
   return helmet({
     /**
-     * This API answers with JSON and nothing else — no HTML, no Swagger UI, no
-     * static assets, no template engine. So the policy can be the strictest
-     * one there is: a response from here has no legitimate reason to load a
-     * script, a style, a font or an image.
+     * Every endpoint except the docs answers with JSON — no HTML, no static
+     * assets, no template engine. So the policy is the strictest there is: a
+     * response from here has no legitimate reason to load a script, a style, a
+     * font or an image.
      *
-     * Worth setting despite there being no HTML today. The cost is one header;
-     * the alternative is depending on nobody ever adding an endpoint that
-     * returns markup, and on whoever adds it remembering this file.
+     * Swagger UI is the one exception and is served under its own policy, in
+     * docsHeaders() below, rather than by loosening this one.
      */
     contentSecurityPolicy: {
       useDefaults: false,
@@ -94,4 +105,69 @@ export function securityHeaders(): RequestHandler {
      */
     xXssProtection: true,
   });
+}
+
+/**
+ * The same headers, with the narrowest CSP that lets Swagger UI render.
+ *
+ * Four directives are opened, and only these:
+ *
+ *  - `script-src 'self'` — the three bundle files. Notably WITHOUT
+ *    `'unsafe-inline'`: this build of @nestjs/swagger emits no inline
+ *    `<script>`, it links `swagger-ui-init.js` instead, so the dangerous
+ *    relaxation is not needed. If a future version inlines its initialiser the
+ *    page will break here rather than silently weakening the policy.
+ *  - `style-src 'self' 'unsafe-inline'` — the stylesheet, plus two inline
+ *    `<style>` blocks the page really does carry.
+ *  - `img-src 'self' data:` — the two favicons, and icons embedded as data
+ *    URIs inside the stylesheet.
+ *  - `connect-src 'self'` — "Try it out" calls this same origin.
+ *
+ * Everything else stays `'none'`, and the page serves no user data: it is the
+ * spec document and a UI built from it.
+ */
+function docsHeaders(): RequestHandler {
+  return helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        'default-src': ["'none'"],
+        'script-src': ["'self'"],
+        'style-src': ["'self'", "'unsafe-inline'"],
+        'img-src': ["'self'", 'data:'],
+        'font-src': ["'self'"],
+        'connect-src': ["'self'"],
+        'frame-ancestors': ["'none'"],
+        'base-uri': ["'none'"],
+        'form-action': ["'none'"],
+      },
+    },
+    strictTransportSecurity: {
+      maxAge: 31_536_000,
+      includeSubDomains: true,
+      preload: false,
+    },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
+    crossOriginEmbedderPolicy: false,
+    referrerPolicy: { policy: 'no-referrer' },
+    xFrameOptions: { action: 'deny' },
+    xContentTypeOptions: true,
+    xXssProtection: true,
+  });
+}
+
+/**
+ * Picks the policy by path, so `main.ts` still installs one handler.
+ *
+ * Prefix match rather than an exact one: the UI fetches its bundles and
+ * favicons from under the same path, and `/api/docs-json` sits beside it.
+ */
+export function securityHeaders(): RequestHandler {
+  const api = apiHeaders();
+  const docs = docsHeaders();
+  return (req, res, next) =>
+    req.path.startsWith(DOCS_PREFIX)
+      ? docs(req, res, next)
+      : api(req, res, next);
 }

@@ -5,7 +5,9 @@ import {
   IsOptional,
   Matches,
 } from 'class-validator';
-import { MAJOR_ACRONYM_PATTERN, MAJOR_NAME_PATTERN } from './create-major.dto';
+import { MAJOR_ACRONYM_PATTERN } from './create-major.dto';
+import { ACADEMIC_NAME_PATTERN } from '../../../common/dto/text-patterns';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
  * Every field optional — the form sends only what changed, and a multipart
@@ -15,8 +17,12 @@ export class UpdateMajorDto {
   @IsOptional()
   @IsString()
   @MaxLength(100)
-  @Matches(MAJOR_NAME_PATTERN, {
+  @Matches(ACADEMIC_NAME_PATTERN, {
     message: 'Major name must not contain special characters',
+  })
+  @ApiPropertyOptional({
+    description: 'New department name.',
+    maxLength: 100,
   })
   name?: string;
 
@@ -26,8 +32,15 @@ export class UpdateMajorDto {
   @Matches(MAJOR_ACRONYM_PATTERN, {
     message: 'Acronym must be uppercase letters and numbers only',
   })
+  @ApiPropertyOptional({
+    description: 'New acronym. Uppercase letters and numbers only, and unique.',
+    maxLength: 10,
+  })
   acronym?: string;
 
+  @ApiPropertyOptional({
+    description: 'New logo URL.',
+  })
   @IsOptional()
   @IsUrl()
   image_url?: string;

@@ -1,17 +1,20 @@
 import { Global, Module } from '@nestjs/common';
-import { ClamAvService } from './clamav.service';
 
 /**
- * Global so the scanner is one instance with one connection policy, and so a
- * module that accepts files does not have to remember to import it.
+ * Cross-cutting security services.
  *
- * There is exactly one provider here today. It is a module rather than a bare
- * provider because the boot-time reachability check lives in `onModuleInit`,
- * and that only runs for something Nest owns.
+ * Held open deliberately after the malware scanner was removed: this is where
+ * a scanner, a content-inspection service or an upload-signing helper would be
+ * registered, and the module is `@Global()` so a feature module that accepts
+ * files does not have to remember to import it.
+ *
+ * Signature validation does NOT live here — it is a pure function with no
+ * dependencies (`modules/documents/utils/file-signature.ts`), so making it a
+ * provider would buy nothing and cost a mock in every test that touches it.
  */
 @Global()
 @Module({
-  providers: [ClamAvService],
-  exports: [ClamAvService],
+  providers: [],
+  exports: [],
 })
 export class SecurityModule {}
